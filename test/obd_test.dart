@@ -501,4 +501,32 @@ void main() {
       expect(kSubscribeIds, contains(s.id));
     }
   });
+
+  // Bluetooth starts no link while this says so (see Commander.waitFor).
+  test('WiFi is trying while it looks, joins or says hello', () {
+    final p = Panda();
+    expect(p.trying, isTrue); // not started: its first try is still to come
+    bool trying(WifiLink l) => (p..show(l, '')).trying;
+    for (final l in [WifiLink.scanning, WifiLink.joining, WifiLink.hello]) {
+      expect(trying(l), isTrue, reason: '$l');
+    }
+    for (final l in [WifiLink.wifiOff, WifiLink.away, WifiLink.retrying, WifiLink.quiet]) {
+      expect(trying(l), isFalse, reason: '$l');
+    }
+    p.show(WifiLink.hello, 'live'); // frames arriving: live, whatever else it says
+    expect(p.trying, isFalse);
+  });
+
+  test('a try that is kicked counts as trying at once', () async {
+    TestWidgetsFlutterBinding.ensureInitialized(); // the network channel
+    final p = Panda();
+    await p.connect('127.0.0.1', 9, now: true); // nobody listens there
+    p.show(WifiLink.wifiOff, 'wifi is off — turn it on');
+    expect(p.trying, isFalse); // between tries: Bluetooth may start a link
+    p.kick(); // the phone's WiFi came on, or the app came back
+    // Its own link state comes a platform call later; Bluetooth, kicked in
+    // the same breath, must not slip through that gap.
+    expect(p.trying, isTrue);
+    await p.disconnect();
+  });
 }

@@ -46,6 +46,9 @@ Future<void> _fits(WidgetTester t, String button) async {
     for (var i = 0; i < n; i++) {
       t.view.resetViewInsets();
       await _frames(t);
+      // As a user would: the dialog scrolls (the sliders make it taller than
+      // the screen), so the field is scrolled into view before it is tapped.
+      await t.ensureVisible(fields.at(i));
       await t.tap(fields.at(i));
       await _raise(t, kb);
       expect(t.getRect(find.text(button)).bottom, lessThanOrEqualTo(_screen.height - kb));
@@ -135,11 +138,36 @@ void main() {
     await t.tap(find.byIcon(Icons.wifi_off));
     await _frames(t);
     expect(find.text('Bluetooth off before WiFi starts: 1.0 s'), findsOneWidget);
+    expect(find.text('Bluetooth buttons after WiFi is live: 0.0 s'), findsOneWidget);
     expect(find.text('Bluetooth data after WiFi is live: 5.0 s'), findsOneWidget);
-    await t.drag(find.byType(Slider).last, const Offset(-400, 0)); // all the way down
-    await _frames(t);
+    expect(find.text('Bluetooth back if no WiFi stream: 15.0 s'), findsOneWidget);
+    // Each to an end; the lower ones sit below the short dialog's fold.
+    final prefs = await SharedPreferences.getInstance();
+    Future<void> slide(int i, double dx) async {
+      await t.ensureVisible(find.byType(Slider).at(i));
+      await t.drag(find.byType(Slider).at(i), Offset(dx, 0));
+      await _frames(t);
+    }
+    await slide(1, 400); // all the way up
+    expect(find.text('Bluetooth buttons after WiFi is live: 10.0 s'), findsOneWidget);
+    expect(prefs.getInt('btButtonsMs'), 10000);
+    await slide(2, -400); // all the way down
     expect(find.text('Bluetooth data after WiFi is live: 0.0 s'), findsOneWidget);
-    expect((await SharedPreferences.getInstance()).getInt('btRejoinMs'), 0);
+    expect(prefs.getInt('btRejoinMs'), 0);
+    await slide(3, -400);
+    expect(find.text('Bluetooth back if no WiFi stream: 0.0 s'), findsOneWidget);
+    expect(prefs.getInt('btBackMs'), 0);
+    // The switch for waiting on the WiFi stream: off, kept when flipped.
+    expect(find.text('Bluetooth waits for the WiFi stream, no time limit'), findsOneWidget);
+    expect(t.widget<Switch>(find.byType(Switch)).value, isFalse);
+    await t.ensureVisible(find.byType(Switch));
+    await t.tap(find.byType(Switch));
+    await _frames(t);
+    expect(t.widget<Switch>(find.byType(Switch)).value, isTrue);
+    expect(prefs.getBool('btWifiFirst'), isTrue);
+    // The fallback slider has nothing to time once Bluetooth waits for the stream.
+    expect(t.widget<Slider>(find.byType(Slider).last).onChanged, isNull);
+    expect(t.widget<Slider>(find.byType(Slider).first).onChanged, isNotNull);
     await t.pumpWidget(const SizedBox());
   });
 

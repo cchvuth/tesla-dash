@@ -241,10 +241,10 @@ class MainActivity : FlutterActivity() {
      * Android 10+ shows its "Searching for devices…" dialog) only once it is
      * there. Starts a scan (Android allows an app 4 in 2 minutes) and answers
      * yes on the first scan results that hold it, else whatever the latest
-     * results say after 8 s: any scan's results land in that broadcast, and a
-     * full sweep can take several seconds. Below Android 10 there is no
-     * dialog, and without location access results cannot be read: yes, and
-     * the request decides.
+     * results say after 3 s: any scan's results land in that broadcast. Kept
+     * short: Bluetooth starts no link while it runs. Below Android
+     * 10 there is no dialog, and without location access results cannot be
+     * read: yes, and the request decides.
      */
     private fun wifiNearby(ssid: String?, result: MethodChannel.Result) {
         val readable = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
@@ -278,7 +278,7 @@ class MainActivity : FlutterActivity() {
         } else {
             registerReceiver(receiver, filter)
         }
-        Handler(Looper.getMainLooper()).postDelayed({ answer() }, 8_000)
+        Handler(Looper.getMainLooper()).postDelayed({ answer() }, 3_000)
     }
 
     private fun unbind() {

@@ -51,3 +51,6 @@ app.*.map.json
 *.apk
 *.aab
 *.ipa
+
+# Local-only hardware R&D notes — never tracked (this repo is public)
+/t113/

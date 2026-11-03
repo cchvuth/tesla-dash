@@ -1,9 +1,17 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:flutter_blue_plus_platform_interface/flutter_blue_plus_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pointycastle/export.dart';
 import 'package:tesla_dash/commander.dart';
+
+/// The phone's Bluetooth, switched off: a dial gets as far as seeing that.
+final class _BluetoothOff extends FlutterBluePlusPlatform {
+  @override
+  Future<BmBluetoothAdapterState> getAdapterState(BmBluetoothAdapterStateRequest request) async =>
+      BmBluetoothAdapterState(adapterState: BmAdapterStateEnum.off);
+}
 
 Uint8List hex(String s) => Uint8List.fromList([
       for (var i = 0; i < s.length; i += 2) int.parse(s.substring(i, i + 2), radix: 16)
@@ -81,6 +89,43 @@ void main() {
     // A Commander restarting brings Bluetooth back first: still lean.
     c.wifiLive = false;
     expect(c.dialLevelNow, 1);
+    c.dispose();
+  });
+
+  test('no dial starts while it is WiFi\'s turn', () async {
+    FlutterBluePlusPlatform.instance = _BluetoothOff();
+    String? why = 'waiting for WiFi to try first';
+    final c = Commander()
+      ..waitFor = (() => why)
+      ..connect();
+    await pumpEventQueue();
+    expect((c.link, c.status), (BtLink.paused, why)); // WiFi's turn: no dial
+    c.kick(ask: true); // a tap meanwhile: held too, and the reason stays
+    expect((c.link, c.status), (BtLink.paused, why));
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    expect(c.link, BtLink.paused); // looked at again, still waiting
+    why = null; // WiFi's try is over
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    await pumpEventQueue();
+    expect(c.link, BtLink.off); // dialled, and found Bluetooth off
+    c.dispose();
+  });
+
+  test('a step-aside during the wait leaves nothing to settle, and resume waits too', () async {
+    FlutterBluePlusPlatform.instance = _BluetoothOff();
+    String? why = 'waiting for WiFi to go live';
+    final c = Commander()
+      ..waitFor = (() => why)
+      ..connect();
+    await pumpEventQueue();
+    expect(await c.pause(), isFalse); // nothing was linked: no settle
+    c.resume(); // the dash's timer, with WiFi still not live
+    await pumpEventQueue();
+    expect((c.link, c.status), (BtLink.paused, why));
+    why = null;
+    c.kick(); // as the dash does once WiFi runs: no waiting out the poll
+    await pumpEventQueue();
+    expect(c.link, BtLink.off);
     c.dispose();
   });
 

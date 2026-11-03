@@ -334,6 +334,15 @@ class Panda extends ChangeNotifier {
   /// The link's state for its icon; [status] says it in words.
   WifiLink get link => wifiLive ? WifiLink.live : _link;
 
+  /// WiFi is looking for the Commander, joining or saying hello: its turn,
+  /// so Bluetooth is not to start a link now (see [Commander.waitFor]). Also
+  /// true from the instant a try starts: its kick or retry reaches [link] a
+  /// platform call later, and Bluetooth would slip in between.
+  bool get trying =>
+      _starting ||
+      const {WifiLink.idle, WifiLink.scanning, WifiLink.joining, WifiLink.hello}.contains(link);
+  bool _starting = false;
+
   /// What [link] counts down to (a retry, the hello's answer, a quiet
   /// link's loss), or null.
   DateTime? until;
@@ -442,6 +451,7 @@ class Panda extends ChangeNotifier {
     if (c == null) return;
     final gen = ++_gen;
     _retry?.cancel();
+    _starting = true; // before the first await; the next [_set] says it
     await _teardown();
     if (gen != _gen) return;
     // iOS lets no app join a network: the owner joins it in Settings.
@@ -996,6 +1006,7 @@ class Panda extends ChangeNotifier {
   void show(WifiLink l, String s, [DateTime? t]) => _set(l, s, t);
 
   void _set(WifiLink l, String s, [DateTime? t]) {
+    _starting = false;
     _link = l;
     until = t;
     status = s;

@@ -200,6 +200,7 @@ class Commander extends ChangeNotifier {
     final waiting = _retry?.isActive ?? false;
     if (_dialing || !(waiting || ask)) return;
     _attemptConnect(); // cancels the retry first, so the notify re-kicks nothing
+    if (_link == BtLink.paused) return; // held for WiFi: it says so itself
     _set(
         dash ? BtLink.linking : BtLink.scanning,
         waiting
@@ -248,9 +249,24 @@ class Commander extends ChangeNotifier {
 
   int _gen = 0; // the current attempt; an older one stops at its next step
 
+  /// Says why a dial from scratch is not to start now, or null to go ahead:
+  /// the dash's call on whose turn it is, WiFi's or this link's (see
+  /// [_attemptConnect]).
+  String? Function()? waitFor;
+
   Future<void> _attemptConnect() async {
     final gen = ++_gen;
     _retry?.cancel();
+    // A link made before WiFi's had the Commander switch its WiFi off, so a
+    // dial waits out WiFi's turn. No failure, so no backoff step: looked at
+    // again soon. A link already up is left alone.
+    final why = _on && !ready ? waitFor?.call() : null;
+    if (why != null) {
+      resumeAt = null; // no countdown on the icon
+      if (_link != BtLink.paused || status != why) _set(BtLink.paused, why);
+      _retry = Timer(const Duration(milliseconds: 250), _attemptConnect);
+      return;
+    }
     _dialing = true;
     if (!_asked && _asks > 0) {
       _asked = true; // the retry of an owner's ask is asked too
@@ -805,7 +821,7 @@ enum BtLink {
   approving, // waiting for the in-car double-press
   refused, // not approved: only a tap tries again
   dash, // left to the S3XY Dash on purpose
-  paused, // stepped aside while the WiFi stream starts
+  paused, // stepped aside while the WiFi stream starts, or held back while WiFi is mid-try
   away, // no Commander advertising: car asleep, or the S3XY app has it
   held, // the S3XY app holds the Commander's link
   retrying,

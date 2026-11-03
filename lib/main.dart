@@ -73,10 +73,12 @@ class _DashPageState extends State<DashPage> {
   String _ssid = kDefaultSsid;
   String _password = kDefaultPassword;
   // The gaps around a WiFi stream's start (see [_stepAside]), in ms, tuned
-  // in the WiFi dialog: after Bluetooth steps aside, before the hello; and
-  // once the stream is live, before Bluetooth takes car data again. 1 s
-  // and 5 s held in the car.
-  int _settleMs = 1000, _rejoinMs = 5000;
+  // in the WiFi dialog: after Bluetooth steps aside, before the hello; once
+  // the stream is live, before Bluetooth is back with the buttons and before
+  // it takes car data again (1 s, at once and 5 s held in the car); and
+  // should no stream come, before Bluetooth is back.
+  int _settleMs = 1000, _buttonsMs = 0, _rejoinMs = 5000, _backMs = 15000;
+  bool _wifiFirst = false; // Bluetooth waits for the WiFi stream, however long
 
   void _connect({bool now = false}) =>
       _obd.connect(_host, _port, ssid: _ssid, password: _password, now: now);
@@ -95,7 +97,10 @@ class _DashPageState extends State<DashPage> {
     _ssid = prefs.getString('ssid') ?? kDefaultSsid;
     _password = prefs.getString('password') ?? kDefaultPassword;
     _settleMs = prefs.getInt('btSettleMs') ?? _settleMs;
+    _buttonsMs = prefs.getInt('btButtonsMs') ?? _buttonsMs;
     _rejoinMs = prefs.getInt('btRejoinMs') ?? _rejoinMs;
+    _backMs = prefs.getInt('btBackMs') ?? _backMs;
+    _wifiFirst = prefs.getBool('btWifiFirst') ?? _wifiFirst;
     // The last pressures seen: the car sends them only on the move and shows
     // its stored ones when parked, as the dash then does too.
     final t = prefs.getStringList('tyres');
@@ -121,11 +126,22 @@ class _DashPageState extends State<DashPage> {
     // other way round held. So each new stream waits for Bluetooth to step
     // aside, and Bluetooth comes back once the stream runs.
     _obd.beforeStream = _stepAside;
+    // And a Bluetooth link made before WiFi's try had the Commander switch
+    // its WiFi off: no dial starts mid-try, at start, back in front or on a
+    // retry ([_btWaitsFor]).
+    _bt.waitFor = _btWaitsFor;
     _connect();
     _bt.connect();
   }
 
-  Timer? _btBack;
+  /// Why Bluetooth is not to start a link now, or null ([Commander.waitFor]).
+  /// By default it waits out WiFi's tries; with the dialog's switch on, for
+  /// the WiFi stream itself, however long.
+  String? _btWaitsFor() => _wifiFirst
+      ? _obd.wifiLive ? null : 'waiting for WiFi to go live'
+      : _obd.trying ? 'waiting for WiFi to try first' : null;
+
+  Timer? _btBack, _btButtons;
   bool _streamSeen = true; // the last step-aside was followed by a stream
 
   /// Before a WiFi stream starts: Bluetooth off the Commander (see
@@ -139,10 +155,11 @@ class _DashPageState extends State<DashPage> {
     if (!_streamSeen && defaultTargetPlatform == TargetPlatform.iOS) return;
     _streamSeen = false;
     _btBack?.cancel();
+    _btButtons?.cancel(); // the last stream's, still waiting: not into this one's start
     // Back with the buttons only once the stream runs ([_linksChanged]).
     _bt.dataHold = true;
-    _bt.resumeAt = DateTime.now().add(const Duration(seconds: 15));
-    _btBack = Timer(const Duration(seconds: 15), () {
+    _bt.resumeAt = DateTime.now().add(Duration(milliseconds: _backMs));
+    _btBack = Timer(Duration(milliseconds: _backMs), () {
       _bt.dataHold = false; // no stream came: Bluetooth carries the dash
       _bt.resume();
     });
@@ -170,13 +187,17 @@ class _DashPageState extends State<DashPage> {
     // already streaming. Either link reaching the Commander means it is
     // awake: the other one tries without waiting out its backoff.
     if (_obd.wifiLive && !_wasLive) {
-      _wasLive = true; // first: the kick below may notify, and land here again
       _streamSeen = true;
       _btBack?.cancel();
-      // The buttons at once, no car data yet; what WiFi lacks after the
-      // wait, on the same link.
-      _bt.resume();
-      _bt.kick();
+      _btButtons?.cancel(); // a quiet link back: not a second one beside it
+      // The buttons after their wait (at once by default), no car data yet;
+      // what WiFi lacks after its own, on the same link. Both from now: the
+      // data's wait over first, Bluetooth comes back with it.
+      _bt.resumeAt = DateTime.now().add(Duration(milliseconds: _buttonsMs));
+      _btButtons = Timer(Duration(milliseconds: _buttonsMs), () {
+        _bt.resume();
+        _bt.kick();
+      });
       _bt.dataAt = DateTime.now().add(Duration(milliseconds: _rejoinMs));
       _btBack = Timer(Duration(milliseconds: _rejoinMs), () => _bt.dataHold = false);
     }
@@ -207,6 +228,7 @@ class _DashPageState extends State<DashPage> {
   @override
   void dispose() {
     _btBack?.cancel();
+    _btButtons?.cancel();
     _life?.dispose();
     if (widget.demo == null) _obd.dispose(); // only what we created
     if (widget.bt == null) _bt.dispose();
@@ -285,7 +307,8 @@ class _DashPageState extends State<DashPage> {
     final ssid = TextEditingController(text: _ssid);
     final password = TextEditingController(text: _password);
     // A gap, in seconds, on a slider; it applies and is kept on release.
-    Widget gap(String label, int ms, double maxS, String key, void Function(int) set, StateSetter redraw) =>
+    Widget gap(String label, int ms, double maxS, String key, void Function(int) set, StateSetter redraw,
+            {bool on = true}) =>
         Row(children: [
           Expanded(child: Text('$label: ${(ms / 1000).toStringAsFixed(1)} s')),
           SizedBox(
@@ -294,7 +317,7 @@ class _DashPageState extends State<DashPage> {
               value: ms / 1000,
               max: maxS,
               divisions: (maxS * 10).round(), // 100 ms steps
-              onChanged: (v) => redraw(() => set((v * 1000).round())),
+              onChanged: on ? (v) => redraw(() => set((v * 1000).round())) : null,
               onChangeEnd: (v) async =>
                   (await SharedPreferences.getInstance()).setInt(key, (v * 1000).round()),
             ),
@@ -346,13 +369,33 @@ class _DashPageState extends State<DashPage> {
               ),
             ),
           ]),
+          // Bluetooth never starts a link while WiFi is mid-try. This holds it
+          // back until the WiFi stream runs, however long: for a Commander
+          // that drops its WiFi when Bluetooth comes first. With no WiFi
+          // stream (ScanMyTesla off) there is then no Bluetooth either.
+          const SizedBox(height: 8),
+          Row(children: [
+            const Expanded(child: Text('Bluetooth waits for the WiFi stream, no time limit')),
+            Switch(
+              value: _wifiFirst,
+              onChanged: (v) async {
+                redraw(() => _wifiFirst = v);
+                (await SharedPreferences.getInstance()).setBool('btWifiFirst', v);
+              },
+            ),
+          ]),
           // Bluetooth stays off the Commander while its WiFi stream starts:
           // the dash has no buttons for that spell, shorter if these hold.
-          const SizedBox(height: 8),
           gap('Bluetooth off before WiFi starts', _settleMs, 5, 'btSettleMs',
               (v) => _settleMs = v, redraw),
+          gap('Bluetooth buttons after WiFi is live', _buttonsMs, 10, 'btButtonsMs',
+              (v) => _buttonsMs = v, redraw),
           gap('Bluetooth data after WiFi is live', _rejoinMs, 10, 'btRejoinMs',
               (v) => _rejoinMs = v, redraw),
+          // With the switch on Bluetooth waits for the stream however long,
+          // so this fallback has nothing to time.
+          gap('Bluetooth back if no WiFi stream', _backMs, 30, 'btBackMs',
+              (v) => _backMs = v, redraw, on: !_wifiFirst),
         ]),
         actions: [
           // Bluetooth sticks to the Commander it was approved on; this lets

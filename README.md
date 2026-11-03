@@ -63,8 +63,14 @@ ScanMyTesla is off. While WiFi is live, Bluetooth asks only for what WiFi
 lacks (the route and recirculation): in ScanMyTesla mode the Commander is
 short of memory, so it is not asked for the same data twice. Bluetooth also
 steps aside while the WiFi stream starts and joins once it runs: connected
-before the stream started, the Commander went down. Values neither link
-has are hidden.
+before the stream started, the Commander went down. It also starts no link
+while WiFi is mid-try (at start, when the app comes back, on every retry; on
+Android a look of up to 3 s for `S3XY_OBD`, then the join and the hello):
+connected first, it had the Commander switch its WiFi off. A link already
+being made when a try begins is left to finish. A switch in the WiFi dialog
+makes it wait for the live WiFi stream however long that takes; with
+ScanMyTesla off there is then no Bluetooth either. Values neither link has
+are hidden.
 
 What each setup is missing:
 
