@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The icon's darkest edge, behind its full-bleed foreground. -->
+    <color name="ic_launcher_background">#040608</color>
+</resources>
