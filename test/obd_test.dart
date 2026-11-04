@@ -517,6 +517,70 @@ void main() {
     expect(p.trying, isFalse);
   });
 
+  // A look with no limit waits on until a new try drops it: the dash starts
+  // one when its switch flips, but only while WiFi is looking or between tries.
+  test('relook starts the try over only while looking or between tries', () async {
+    TestWidgetsFlutterBinding.ensureInitialized(); // the network channel
+    final p = Panda();
+    await p.connect('127.0.0.1', 9, now: true); // nobody listens there
+    // A restart ends in a try of its own (saying hello); wait for that so one
+    // try is not still arriving while the next case is set up.
+    Future<void> settle() async {
+      for (var i = 0; i < 150 && !p.status.startsWith('saying hello'); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+    }
+
+    Future<bool> restarted(WifiLink l) async {
+      p.show(l, 'shown');
+      p.relook();
+      await pumpEventQueue();
+      final started = p.status != 'shown';
+      await settle();
+      return started;
+    }
+
+    for (final l in [WifiLink.scanning, WifiLink.away, WifiLink.retrying]) {
+      expect(await restarted(l), isTrue, reason: '$l');
+    }
+    for (final l in [WifiLink.joining, WifiLink.hello, WifiLink.quiet, WifiLink.wifiOff]) {
+      expect(await restarted(l), isFalse, reason: '$l: left alone');
+    }
+    // A stream that came back from a stall is live while the state it last
+    // set still reads retrying: a settings switch must not tear it down.
+    p.show(WifiLink.retrying, 'shown');
+    p.status = 'live';
+    p.relook();
+    await pumpEventQueue();
+    expect(p.status, 'live');
+    await p.disconnect(); // stopped: nothing to start over
+    p.show(WifiLink.away, 'shown');
+    p.relook();
+    await pumpEventQueue();
+    expect(p.status, 'shown');
+  });
+
+  // A look with no limit only listens, so coming back to the app is the
+  // moment to ask for a fresh scan; a bounded one is left to run out.
+  test('a kick restarts a look with no limit, not a bounded one', () async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    final p = Panda()..lookMs = 0;
+    await p.connect('127.0.0.1', 9, now: true);
+    p.show(WifiLink.scanning, 'shown');
+    p.kick();
+    await pumpEventQueue();
+    expect(p.status, isNot('shown'));
+    for (var i = 0; i < 150 && !p.status.startsWith('saying hello'); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    p.lookMs = 3000;
+    p.show(WifiLink.scanning, 'shown');
+    p.kick();
+    await pumpEventQueue();
+    expect(p.status, 'shown');
+    await p.disconnect();
+  });
+
   test('a try that is kicked counts as trying at once', () async {
     TestWidgetsFlutterBinding.ensureInitialized(); // the network channel
     final p = Panda();

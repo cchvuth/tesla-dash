@@ -75,10 +75,24 @@ class _DashPageState extends State<DashPage> {
   // The gaps around a WiFi stream's start (see [_stepAside]), in ms, tuned
   // in the WiFi dialog: after Bluetooth steps aside, before the hello; once
   // the stream is live, before Bluetooth is back with the buttons and before
-  // it takes car data again (1 s, at once and 5 s held in the car); and
-  // should no stream come, before Bluetooth is back.
+  // it takes car data again (1 s, at once and 5 s held in the car; with the
+  // switch on, one wait for both); and should no stream come, before
+  // Bluetooth is back (not with the switch on: it waits for the stream).
   int _settleMs = 1000, _buttonsMs = 0, _rejoinMs = 5000, _backMs = 15000;
   bool _wifiFirst = false; // Bluetooth waits for the WiFi stream, however long
+  int _lookMs = 3000; // the slider's look time; with the switch on the look has none
+
+  /// What the look waits: the slider's time, or with the switch on, for the
+  /// network however long, as Bluetooth waits for the stream just as long.
+  void _applyLook() => _obd.lookMs = _wifiFirst ? 0 : _lookMs;
+
+  /// How long after the stream goes live Bluetooth comes back. It first came
+  /// back with the buttons and took its data after a second wait; with the
+  /// switch on it has not been up before the stream, so its start and its
+  /// data are one sequence and the data's wait stands for both. The dialog's
+  /// merged slider is that same value: tuning it there retunes the data wait
+  /// for when the switch is off.
+  int get _startMs => _wifiFirst ? _rejoinMs : _buttonsMs;
 
   void _connect({bool now = false}) =>
       _obd.connect(_host, _port, ssid: _ssid, password: _password, now: now);
@@ -101,6 +115,9 @@ class _DashPageState extends State<DashPage> {
     _rejoinMs = prefs.getInt('btRejoinMs') ?? _rejoinMs;
     _backMs = prefs.getInt('btBackMs') ?? _backMs;
     _wifiFirst = prefs.getBool('btWifiFirst') ?? _wifiFirst;
+    // Inside the slider's range, whatever was stored.
+    _lookMs = (prefs.getInt('wifiLookMs') ?? _lookMs).clamp(1000, 10000).toInt();
+    _applyLook();
     // The last pressures seen: the car sends them only on the move and shows
     // its stored ones when parked, as the dash then does too.
     final t = prefs.getStringList('tyres');
@@ -156,13 +173,18 @@ class _DashPageState extends State<DashPage> {
     _streamSeen = false;
     _btBack?.cancel();
     _btButtons?.cancel(); // the last stream's, still waiting: not into this one's start
-    // Back with the buttons only once the stream runs ([_linksChanged]).
+    // Back only once the stream runs ([_linksChanged]): with the buttons, and
+    // the data after its wait.
     _bt.dataHold = true;
-    _bt.resumeAt = DateTime.now().add(Duration(milliseconds: _backMs));
-    _btBack = Timer(Duration(milliseconds: _backMs), () {
-      _bt.dataHold = false; // no stream came: Bluetooth carries the dash
-      _bt.resume();
-    });
+    // Not with the switch on: Bluetooth waits for the stream however long, and
+    // a Bluetooth resumed early would dial the instant the stream goes live.
+    _bt.resumeAt = _wifiFirst ? null : DateTime.now().add(Duration(milliseconds: _backMs));
+    if (!_wifiFirst) {
+      _btBack = Timer(Duration(milliseconds: _backMs), () {
+        _bt.dataHold = false; // no stream came: Bluetooth carries the dash
+        _bt.resume();
+      });
+    }
     // A link was up: give the Commander a moment before the hello.
     if (await _bt.pause()) await Future<void>.delayed(Duration(milliseconds: _settleMs));
   }
@@ -190,11 +212,12 @@ class _DashPageState extends State<DashPage> {
       _streamSeen = true;
       _btBack?.cancel();
       _btButtons?.cancel(); // a quiet link back: not a second one beside it
-      // The buttons after their wait (at once by default), no car data yet;
-      // what WiFi lacks after its own, on the same link. Both from now: the
-      // data's wait over first, Bluetooth comes back with it.
-      _bt.resumeAt = DateTime.now().add(Duration(milliseconds: _buttonsMs));
-      _btButtons = Timer(Duration(milliseconds: _buttonsMs), () {
+      // Bluetooth comes back after [_startMs]. Switch off: with the buttons
+      // only (at once by default), and what WiFi lacks after the data's own
+      // wait, on the same link. Switch on: one wait, and it comes back already
+      // with its data, the hold lifting at that same moment.
+      _bt.resumeAt = DateTime.now().add(Duration(milliseconds: _startMs));
+      _btButtons = Timer(Duration(milliseconds: _startMs), () {
         _bt.resume();
         _bt.kick();
       });
@@ -308,15 +331,16 @@ class _DashPageState extends State<DashPage> {
     final password = TextEditingController(text: _password);
     // A gap, in seconds, on a slider; it applies and is kept on release.
     Widget gap(String label, int ms, double maxS, String key, void Function(int) set, StateSetter redraw,
-            {bool on = true}) =>
+            {bool on = true, double min = 0}) =>
         Row(children: [
           Expanded(child: Text('$label: ${(ms / 1000).toStringAsFixed(1)} s')),
           SizedBox(
             width: 240,
             child: Slider(
               value: ms / 1000,
+              min: min,
               max: maxS,
-              divisions: (maxS * 10).round(), // 100 ms steps
+              divisions: ((maxS - min) * 10).round(), // 100 ms steps
               onChanged: on ? (v) => redraw(() => set((v * 1000).round())) : null,
               onChangeEnd: (v) async =>
                   (await SharedPreferences.getInstance()).setInt(key, (v * 1000).round()),
@@ -369,10 +393,19 @@ class _DashPageState extends State<DashPage> {
               ),
             ),
           ]),
+          // How long the look for the network waits for the phone's scan, at
+          // most: it answers on the first results that hold the network. Not
+          // below 1 s, which only reads the scan before (a miss, or a stale
+          // yes). None with the switch on: the look then has no limit, as
+          // Bluetooth has none. Android only: iOS joins in Settings.
+          if (defaultTargetPlatform == TargetPlatform.android && !_wifiFirst)
+            gap('WiFi scan time', _lookMs, 10, 'wifiLookMs',
+                (v) { _lookMs = v; _applyLook(); }, redraw, min: 1),
           // Bluetooth never starts a link while WiFi is mid-try. This holds it
           // back until the WiFi stream runs, however long: for a Commander
           // that drops its WiFi when Bluetooth comes first. With no WiFi
-          // stream (ScanMyTesla off) there is then no Bluetooth either.
+          // stream (ScanMyTesla off) there is then no Bluetooth either. It also
+          // takes the time limit off WiFi's look for the network.
           const SizedBox(height: 8),
           Row(children: [
             const Expanded(child: Text('Bluetooth waits for the WiFi stream, no time limit')),
@@ -380,6 +413,8 @@ class _DashPageState extends State<DashPage> {
               value: _wifiFirst,
               onChanged: (v) async {
                 redraw(() => _wifiFirst = v);
+                _applyLook();
+                _obd.relook(); // a look in progress takes the new limit now
                 (await SharedPreferences.getInstance()).setBool('btWifiFirst', v);
               },
             ),
@@ -388,10 +423,13 @@ class _DashPageState extends State<DashPage> {
           // the dash has no buttons for that spell, shorter if these hold.
           gap('Bluetooth off before WiFi starts', _settleMs, 5, 'btSettleMs',
               (v) => _settleMs = v, redraw),
-          gap('Bluetooth buttons after WiFi is live', _buttonsMs, 10, 'btButtonsMs',
-              (v) => _buttonsMs = v, redraw),
-          gap('Bluetooth data after WiFi is live', _rejoinMs, 10, 'btRejoinMs',
-              (v) => _rejoinMs = v, redraw),
+          // Two waits, the buttons then the data; one with the switch on
+          // (see [_startMs]).
+          if (!_wifiFirst)
+            gap('Bluetooth buttons after WiFi is live', _buttonsMs, 10, 'btButtonsMs',
+                (v) => _buttonsMs = v, redraw),
+          gap(_wifiFirst ? 'Bluetooth after WiFi is live' : 'Bluetooth data after WiFi is live',
+              _rejoinMs, 10, 'btRejoinMs', (v) => _rejoinMs = v, redraw),
           // With the switch on Bluetooth waits for the stream however long,
           // so this fallback has nothing to time.
           gap('Bluetooth back if no WiFi stream', _backMs, 30, 'btBackMs',

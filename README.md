@@ -65,12 +65,13 @@ short of memory, so it is not asked for the same data twice. Bluetooth also
 steps aside while the WiFi stream starts and joins once it runs: connected
 before the stream started, the Commander went down. It also starts no link
 while WiFi is mid-try (at start, when the app comes back, on every retry; on
-Android a look of up to 3 s for `S3XY_OBD`, then the join and the hello):
+Android a look for `S3XY_OBD`, up to 3 s by default and 1-10 s on the dialog's
+scan-time slider, then the join and the hello):
 connected first, it had the Commander switch its WiFi off. A link already
 being made when a try begins is left to finish. A switch in the WiFi dialog
-makes it wait for the live WiFi stream however long that takes; with
-ScanMyTesla off there is then no Bluetooth either. Values neither link has
-are hidden.
+makes it wait for the live WiFi stream however long that takes, and WiFi
+then looks for the network with no time limit; with ScanMyTesla off there
+is then no Bluetooth either. Values neither link has are hidden.
 
 What each setup is missing:
 
@@ -103,7 +104,8 @@ the scroll-wheel approval only the first time, or when you tap.
    - Android joins `S3XY_OBD` itself (approve the system dialog once) and
      keeps mobile data for everything else.
    - On iPhone, join `S3XY_OBD` in Settings › Wi-Fi.
-   - The WiFi icon's dialog edits the network, host and port.
+   - The WiFi icon's dialog edits the network, host and port, the Android
+     scan time and the Bluetooth timings.
 3. Close the S3XY app: the Commander takes one Bluetooth client at a time.
    The first time, approve the phone in the car by double-pressing the
    right scroll wheel. A refused link waits for you rather than retrying

@@ -12,6 +12,17 @@ import 'package:tesla_dash/main.dart';
 import 'package:tesla_dash/panda.dart';
 
 
+/// A WiFi link that counts the restarts the dialog's switch asks for.
+class _CountingPanda extends Panda {
+  int relooks = 0;
+
+  @override
+  void relook() {
+    relooks++;
+    super.relook();
+  }
+}
+
 const _screen = Size(823, 384);
 const _keyboards = [160.0, 200.0, 240.0]; // dp, as tall as phone keyboards get
 
@@ -87,12 +98,12 @@ void main() {
     final o = Panda(), bt = Commander();
     await t.pumpWidget(MaterialApp(theme: kTheme, home: DashPage(demo: o, bt: bt)));
     o.show(WifiLink.retrying, 'link lost — retrying in 5s', DateTime.now().add(const Duration(milliseconds: 4500)));
-    bt.show(BtLink.paused, 'waiting for the WiFi stream to start');
+    bt.show(BtLink.paused, 'stepped aside for the WiFi stream');
     await t.pump();
     Finder on(String tip, String text) => find.descendant(of: find.byTooltip(tip), matching: find.text(text));
     expect(on('WiFi: link lost — retrying in 5s', 'RETRY'), findsOneWidget);
     expect(on('WiFi: link lost — retrying in 5s', '5'), findsOneWidget);
-    expect(on('Commander: waiting for the WiFi stream to start', 'WAIT'), findsOneWidget);
+    expect(on('Commander: stepped aside for the WiFi stream', 'WAIT'), findsOneWidget);
     // A real second (the test's own clock does not move DateTime.now), and
     // the button's tick redraws it with the link saying nothing.
     await t.runAsync(() => Future<void>.delayed(const Duration(seconds: 1)));
@@ -131,30 +142,47 @@ void main() {
     await t.pumpWidget(const SizedBox());
   });
 
-  // The gaps around a WiFi stream's start: on sliders, kept on release.
-  testWidgets('Bluetooth gaps on the WiFi dialog', (t) async {
+  // The WiFi look and the gaps around a WiFi stream's start: on sliders, kept
+  // on release. Each is found by what it says, so a slider added above one
+  // does not renumber the rest.
+  testWidgets('WiFi and Bluetooth timings on the WiFi dialog', (t) async {
     SharedPreferences.setMockInitialValues({});
-    await t.pumpWidget(MaterialApp(theme: kTheme, home: DashPage(demo: Panda(), bt: Commander())));
+    final wifi = _CountingPanda();
+    await t.pumpWidget(MaterialApp(theme: kTheme, home: DashPage(demo: wifi, bt: Commander())));
     await t.tap(find.byIcon(Icons.wifi_off));
     await _frames(t);
+    expect(find.text('WiFi scan time: 3.0 s'), findsOneWidget);
+    expect(wifi.lookMs, 3000);
     expect(find.text('Bluetooth off before WiFi starts: 1.0 s'), findsOneWidget);
     expect(find.text('Bluetooth buttons after WiFi is live: 0.0 s'), findsOneWidget);
     expect(find.text('Bluetooth data after WiFi is live: 5.0 s'), findsOneWidget);
     expect(find.text('Bluetooth back if no WiFi stream: 15.0 s'), findsOneWidget);
-    // Each to an end; the lower ones sit below the short dialog's fold.
     final prefs = await SharedPreferences.getInstance();
-    Future<void> slide(int i, double dx) async {
-      await t.ensureVisible(find.byType(Slider).at(i));
-      await t.drag(find.byType(Slider).at(i), Offset(dx, 0));
+    // A slider is in the row of its label.
+    Finder slider(String label) => find.descendant(
+        of: find.ancestor(of: find.textContaining(label), matching: find.byType(Row)),
+        matching: find.byType(Slider));
+    // Each to an end; the lower ones sit below the short dialog's fold.
+    Future<void> slide(String label, double dx) async {
+      await t.ensureVisible(slider(label));
+      await t.drag(slider(label), Offset(dx, 0));
       await _frames(t);
     }
-    await slide(1, 400); // all the way up
+    await slide('WiFi scan time', -400); // all the way down: 1 s, never 0
+    expect(find.text('WiFi scan time: 1.0 s'), findsOneWidget);
+    expect(prefs.getInt('wifiLookMs'), 1000);
+    await slide('WiFi scan time', 60); // partway up (a drag starts at the middle of the track)
+    final look = prefs.getInt('wifiLookMs')!;
+    expect(look, allOf(greaterThan(0), lessThan(10000)));
+    expect(find.text('WiFi scan time: ${(look / 1000).toStringAsFixed(1)} s'), findsOneWidget);
+    expect(wifi.lookMs, look); // what the Android look waits, at its next run
+    await slide('Bluetooth buttons after WiFi is live', 400); // all the way up
     expect(find.text('Bluetooth buttons after WiFi is live: 10.0 s'), findsOneWidget);
     expect(prefs.getInt('btButtonsMs'), 10000);
-    await slide(2, -400); // all the way down
+    await slide('Bluetooth data after WiFi is live', -400); // all the way down
     expect(find.text('Bluetooth data after WiFi is live: 0.0 s'), findsOneWidget);
     expect(prefs.getInt('btRejoinMs'), 0);
-    await slide(3, -400);
+    await slide('Bluetooth back if no WiFi stream', -400);
     expect(find.text('Bluetooth back if no WiFi stream: 0.0 s'), findsOneWidget);
     expect(prefs.getInt('btBackMs'), 0);
     // The switch for waiting on the WiFi stream: off, kept when flipped.
@@ -165,11 +193,47 @@ void main() {
     await _frames(t);
     expect(t.widget<Switch>(find.byType(Switch)).value, isTrue);
     expect(prefs.getBool('btWifiFirst'), isTrue);
-    // The fallback slider has nothing to time once Bluetooth waits for the stream.
-    expect(t.widget<Slider>(find.byType(Slider).last).onChanged, isNull);
-    expect(t.widget<Slider>(find.byType(Slider).first).onChanged, isNotNull);
+    // The fallback slider has nothing to time once Bluetooth waits for the
+    // stream; the others stay live.
+    expect(t.widget<Slider>(slider('Bluetooth back if no WiFi stream')).onChanged, isNull);
+    // WiFi then looks for the network with no limit, as Bluetooth waits with
+    // none: no scan time slider, and the look is told 0.
+    expect(find.textContaining('WiFi scan time'), findsNothing);
+    expect(wifi.lookMs, 0);
+    expect(wifi.relooks, 1); // a look in progress takes the new limit now
+    // And Bluetooth then starts only after the stream, buttons and data in
+    // one go: their two waits are one slider, the data's.
+    expect(find.byType(Slider), findsNWidgets(3)); // off before, after live, back
+    expect(find.textContaining('Bluetooth buttons after WiFi is live'), findsNothing);
+    expect(find.text('Bluetooth after WiFi is live: 0.0 s'), findsOneWidget);
+    // That slider is the data's value: moving it writes btRejoinMs and leaves
+    // the buttons' alone.
+    await slide('Bluetooth after WiFi is live', 60);
+    final merged = prefs.getInt('btRejoinMs')!;
+    expect(merged, allOf(greaterThan(0), lessThan(10000)));
+    expect(prefs.getInt('btButtonsMs'), 10000);
+    await t.tap(find.byType(Switch)); // off again: the buttons' wait is back as it was left
+    await _frames(t);
+    expect(find.byType(Slider), findsNWidgets(5));
+    expect(find.text('WiFi scan time: ${(look / 1000).toStringAsFixed(1)} s'), findsOneWidget);
+    expect(wifi.lookMs, look); // the slider's time again
+    expect(wifi.relooks, 2);
+    expect(find.text('Bluetooth buttons after WiFi is live: 10.0 s'), findsOneWidget);
+    expect(find.text('Bluetooth data after WiFi is live: ${(merged / 1000).toStringAsFixed(1)} s'), findsOneWidget);
+    expect(prefs.getBool('btWifiFirst'), isFalse);
     await t.pumpWidget(const SizedBox());
   });
+
+  // iPhone joins the network in Settings: there is no look to time.
+  testWidgets('no WiFi scan time slider on iPhone', (t) async {
+    SharedPreferences.setMockInitialValues({});
+    await t.pumpWidget(MaterialApp(theme: kTheme, home: DashPage(demo: Panda(), bt: Commander())));
+    await t.tap(find.byIcon(Icons.wifi_off));
+    await _frames(t);
+    expect(find.textContaining('WiFi scan time'), findsNothing);
+    expect(find.text('Bluetooth off before WiFi starts: 1.0 s'), findsOneWidget);
+    await t.pumpWidget(const SizedBox());
+  }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
 
   // The dash caps text at 1.15; the nav bar's longest values and a full
   // battery must still fit instead of running off, and a destination's

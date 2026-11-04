@@ -397,7 +397,7 @@ class Panda extends ChangeNotifier {
 
   Future<bool> _wifiNearby(String ssid) async {
     try {
-      return await _net.invokeMethod<bool>('wifiNearby', {'ssid': ssid}) ?? true;
+      return await _net.invokeMethod<bool>('wifiNearby', {'ssid': ssid, 'ms': lookMs}) ?? true;
     } on PlatformException {
       return true;
     }
@@ -446,6 +446,26 @@ class Panda extends ChangeNotifier {
   /// Awaited before each hello, which starts the Commander's stream.
   Future<void> Function()? beforeStream;
 
+  /// How long (ms) Android's look for the Commander's network waits for the
+  /// phone's scan results before it answers from the latest ones (the dash's
+  /// slider; read at each look). 0 is no limit: it waits for the network to
+  /// show up in them, however long, until a new try, [relook] or the phone's
+  /// WiFi going off drops it. Bluetooth starts no link while it runs.
+  int lookMs = 3000;
+
+  /// Starts the try over now when WiFi is looking or waiting between tries,
+  /// so a changed [lookMs] applies at once (a look with no limit would
+  /// otherwise wait on). A joining, saying hello or live link is left alone:
+  /// by [link], as a stream that came back from a stall is live while the
+  /// state it last set still reads retrying.
+  void relook() {
+    if (_cfg == null) return;
+    if (const {WifiLink.scanning, WifiLink.away, WifiLink.retrying}.contains(link)) {
+      _attempt = 0;
+      _attemptConnect();
+    }
+  }
+
   Future<void> _attemptConnect() async {
     final c = _cfg;
     if (c == null) return;
@@ -455,7 +475,9 @@ class Panda extends ChangeNotifier {
     await _teardown();
     if (gen != _gen) return;
     // iOS lets no app join a network: the owner joins it in Settings.
-    _set(WifiLink.scanning, 'looking for ${c.ssid}…${_attempt > 0 ? ' (try ${_attempt + 1})' //
+    _set(WifiLink.scanning, Platform.isAndroid && lookMs == 0
+        ? 'looking for ${c.ssid} until it shows up…'
+        : 'looking for ${c.ssid}…${_attempt > 0 ? ' (try ${_attempt + 1})' //
         : Platform.isAndroid ? '' : ' join it in Settings › Wi-Fi'}');
     if (Platform.isAndroid && !await _wifiOn()) {
       if (gen != _gen) return;
@@ -545,9 +567,14 @@ class Panda extends ChangeNotifier {
 
   /// Tries now instead of at the end of the backoff. Does nothing while
   /// live or mid-attempt (a pending WiFi request already connects the
-  /// moment the network shows up).
+  /// moment the network shows up), except a look with no limit: it only
+  /// listens, so this is the moment to ask for a fresh scan.
   void kick() {
     if (_cfg == null) return;
+    if (lookMs == 0 && _link == WifiLink.scanning) {
+      _attemptConnect();
+      return;
+    }
     // A retry pending, or the phone's WiFi off, which has no retry: the
     // word that it came on (or the app coming back) starts the next look.
     if ((_retry?.isActive ?? false) || _link == WifiLink.wifiOff) _attemptConnect();

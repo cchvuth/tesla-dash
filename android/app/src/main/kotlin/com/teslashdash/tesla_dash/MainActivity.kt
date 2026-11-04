@@ -108,9 +108,13 @@ class MainActivity : FlutterActivity() {
                         call.argument<String>("password"),
                         result,
                     )
-                    "unbind" -> { unbind(); result.success(null) }
+                    "unbind" -> { unbind(); stopLook?.invoke(); result.success(null) }
                     "wifiOn" -> result.success(wm.isWifiEnabled)
-                    "wifiNearby" -> wifiNearby(call.argument<String>("ssid"), result)
+                    "wifiNearby" -> wifiNearby(
+                        call.argument<String>("ssid"),
+                        call.argument<Int>("ms") ?: 3_000,
+                        result,
+                    )
                     // Android 12+ silently returns no scan results while
                     // Location services are off, even with permission granted.
                     "locationOn" -> result.success(
@@ -236,40 +240,60 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    /** Ends the look for the Commander's network that is waiting, if any: no. */
+    private var stopLook: (() -> Unit)? = null
+
     /**
      * Whether the phone sees [ssid], so the app asks for the network (and
      * Android 10+ shows its "Searching for devices…" dialog) only once it is
      * there. Starts a scan (Android allows an app 4 in 2 minutes) and answers
      * yes on the first scan results that hold it, else whatever the latest
-     * results say after 3 s: any scan's results land in that broadcast. Kept
-     * short: Bluetooth starts no link while it runs. Below Android
-     * 10 there is no dialog, and without location access results cannot be
-     * read: yes, and the request decides.
+     * results say after [waitMs] (the dash's slider, 3 s by default): any
+     * scan's results land in that broadcast. A longer wait holds Bluetooth
+     * back longer: it starts no link while this runs. [waitMs] 0 is no limit:
+     * it waits for results that hold the network however long that takes,
+     * asking for a fresh scan every 30 s (about what the quota allows), and
+     * answers no only when [stopLook] ends it. One look at a time. Below
+     * Android 10 there is no dialog, and without location access results
+     * cannot be read: yes, and the request decides.
      */
-    private fun wifiNearby(ssid: String?, result: MethodChannel.Result) {
-        val readable = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+    private fun wifiNearby(ssid: String?, waitMs: Int, result: MethodChannel.Result) {
+        stopLook?.invoke() // the one before is over: its answer is no longer wanted
+        fun readable() = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
             PackageManager.PERMISSION_GRANTED &&
             (Build.VERSION.SDK_INT < Build.VERSION_CODES.P ||
                 getSystemService(LocationManager::class.java)?.isLocationEnabled == true)
-        if (!readable || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+        if (!readable() || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             result.success(true)
             return
         }
         @Suppress("DEPRECATION")
         fun seen() = runCatching { wm.scanResults }.getOrNull().orEmpty().any { it.SSID == ssid }
+        val ui = Handler(Looper.getMainLooper())
         var answered = false
         var receiver: BroadcastReceiver? = null
-        fun answer() {
+        var timeout: Runnable? = null
+        var again: Runnable? = null
+        var stop: (() -> Unit)? = null
+        fun finish(yes: Boolean) {
             if (answered) return
             answered = true
             receiver?.let { runCatching { unregisterReceiver(it) } }
-            result.success(seen())
+            timeout?.let { ui.removeCallbacks(it) }
+            again?.let { ui.removeCallbacks(it) }
+            if (stopLook === stop) stopLook = null
+            result.success(yes)
         }
+        stop = { finish(false) }
+        stopLook = stop
         @Suppress("DEPRECATION")
-        if (!runCatching { wm.startScan() }.getOrDefault(false)) return answer()
+        val started = runCatching { wm.startScan() }.getOrDefault(false)
+        // Refused: the latest results decide. With no limit only a yes counts;
+        // a no waits for fresh results.
+        if (!started && (waitMs > 0 || seen())) return finish(seen())
         receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
-                if (seen()) answer()
+                if (seen()) finish(true)
             }
         }
         val filter = IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
@@ -278,7 +302,24 @@ class MainActivity : FlutterActivity() {
         } else {
             registerReceiver(receiver, filter)
         }
-        Handler(Looper.getMainLooper()).postDelayed({ answer() }, 3_000)
+        if (waitMs > 0) {
+            val t = Runnable { finish(seen()) }
+            timeout = t
+            ui.postDelayed(t, waitMs.toLong())
+        } else {
+            val r = object : Runnable {
+                override fun run() {
+                    // Results can no longer be read (Location went off): the
+                    // request decides, as at the start.
+                    if (!readable()) return finish(true)
+                    @Suppress("DEPRECATION")
+                    runCatching { wm.startScan() }
+                    ui.postDelayed(this, 30_000)
+                }
+            }
+            again = r
+            ui.postDelayed(r, 30_000)
+        }
     }
 
     private fun unbind() {
@@ -289,6 +330,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         runCatching { unregisterReceiver(wifiState) }
+        stopLook?.invoke()
         channel = null
         unbind()
         releaseLandscape()

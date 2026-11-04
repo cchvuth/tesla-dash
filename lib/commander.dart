@@ -310,7 +310,7 @@ class Commander extends ChangeNotifier {
     _retry?.cancel();
     _refitTimer?.cancel();
     await _teardown();
-    if (_redial) _set(BtLink.paused, 'waiting for the WiFi stream to start');
+    if (_redial) _set(BtLink.paused, 'stepped aside for the WiFi stream');
     return was;
   }
 
@@ -575,9 +575,9 @@ class Commander extends ChangeNotifier {
   }
 
   /// Set by the dash while a WiFi stream starts and settles: no car data
-  /// over Bluetooth then, the buttons only (the buttons at once, the rest
-  /// after a wait). Lifted, the session takes what WiFi lacks on the same
-  /// link.
+  /// over Bluetooth then, the buttons only (the buttons after one wait, the
+  /// rest after another; with the dash's switch on, one wait for both).
+  /// Lifted, the session takes what WiFi lacks on the same link.
   bool get dataHold => _dataHold;
   set dataHold(bool v) {
     if (v == _dataHold) return;
