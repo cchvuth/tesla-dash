@@ -118,7 +118,11 @@ void main() {
     expect(find.byIcon(Icons.bluetooth_connected), findsOneWidget);
     expect(find.text('LIVE'), findsNothing);
     expect(find.text('READY'), findsNothing);
-    expect(t.getSize(find.byTooltip('WiFi: live')).width, 36);
+    const tip = 'WiFi: live, 0 speed frames/s (the car sends about 50), 0 frames/s in all';
+    expect(t.getSize(find.byTooltip(tip)).width, 36);
+    // The speed frames a second under the icon, red at 0: the lag gauge.
+    final rate = t.widget<Text>(find.descendant(of: find.byTooltip(tip), matching: find.text('0')));
+    expect(rate.style!.color, kAlert);
     await t.pumpWidget(const SizedBox());
   });
 
@@ -178,6 +182,15 @@ void main() {
     expect(wifi.lookMs, look); // what the Android look waits, at its next run
     await slide('Bluetooth buttons after WiFi is live', 400); // all the way up
     expect(find.text('Bluetooth buttons after WiFi is live: 10.0 s'), findsOneWidget);
+    // The power ring's glide: on unless switched off, and kept.
+    expect(find.text('Smooth power ring (more battery)'), findsOneWidget);
+    final smooth = find.byType(Switch).last;
+    expect(t.widget<Switch>(smooth).value, isTrue);
+    await t.ensureVisible(smooth);
+    await t.tap(smooth);
+    await _frames(t);
+    expect(t.widget<Switch>(smooth).value, isFalse);
+    expect(prefs.getBool('smoothRing'), isFalse);
     expect(prefs.getInt('btButtonsMs'), 10000);
     await slide('Bluetooth data after WiFi is live', -400); // all the way down
     expect(find.text('Bluetooth data after WiFi is live: 0.0 s'), findsOneWidget);
@@ -187,11 +200,12 @@ void main() {
     expect(prefs.getInt('btBackMs'), 0);
     // The switch for waiting on the WiFi stream: off, kept when flipped.
     expect(find.text('Bluetooth waits for the WiFi stream, no time limit'), findsOneWidget);
-    expect(t.widget<Switch>(find.byType(Switch)).value, isFalse);
-    await t.ensureVisible(find.byType(Switch));
-    await t.tap(find.byType(Switch));
+    final waits = find.byType(Switch).first;
+    expect(t.widget<Switch>(waits).value, isFalse);
+    await t.ensureVisible(waits);
+    await t.tap(waits);
     await _frames(t);
-    expect(t.widget<Switch>(find.byType(Switch)).value, isTrue);
+    expect(t.widget<Switch>(waits).value, isTrue);
     expect(prefs.getBool('btWifiFirst'), isTrue);
     // The fallback slider has nothing to time once Bluetooth waits for the
     // stream; the others stay live.
@@ -212,7 +226,8 @@ void main() {
     final merged = prefs.getInt('btRejoinMs')!;
     expect(merged, allOf(greaterThan(0), lessThan(10000)));
     expect(prefs.getInt('btButtonsMs'), 10000);
-    await t.tap(find.byType(Switch)); // off again: the buttons' wait is back as it was left
+    await t.ensureVisible(waits);
+    await t.tap(waits); // off again: the buttons' wait is back as it was left
     await _frames(t);
     expect(find.byType(Slider), findsNWidgets(5));
     expect(find.text('WiFi scan time: ${(look / 1000).toStringAsFixed(1)} s'), findsOneWidget);
@@ -349,5 +364,20 @@ void main() {
       await _frames(t);
     }
     await t.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('glide off: small changes land at once, jumps still glide', (t) async {
+    Widget ring(double rear) => MaterialApp(
+        home: RingGauge(glideAll: false, frontKw: 0, rearKw: rear, child: const SizedBox()));
+    await t.pumpWidget(ring(10));
+    await t.pumpAndSettle();
+    await t.pumpWidget(ring(11)); // under 2 kW: no animation, so no redraws
+    expect(t.hasRunningAnimations, isFalse);
+    await t.pumpWidget(ring(20)); // a jump glides
+    expect(t.hasRunningAnimations, isTrue);
+    await t.pumpAndSettle();
+    await t.pumpWidget(MaterialApp(
+        home: RingGauge(frontKw: 0, rearKw: 21, child: const SizedBox()))); // glide on: every change
+    expect(t.hasRunningAnimations, isTrue);
   });
 }

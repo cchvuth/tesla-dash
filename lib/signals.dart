@@ -56,14 +56,39 @@ const kSignals = <String, Sig>{
   // turning left), on the Commander's stream at 49 Hz; with the speed it
   // gives the sideways g, as its own g-sensor (0x111) never comes.
   'yaw': Sig(0x101, 0, 16, scale: 0.0001, signed: true, sna: 32768), // rad/s
-  // DI_brakePedalState: 0 OFF, 1 ON, 2 INVALID. No sna: INVALID must read as
-  // not braking, or the last ON sticks (it did, after an auto-park).
-  'brake': Sig(0x118, 19, 2),
+  // The brake pedal, 1 ON. DI_brakePedalState (19|2: 0 OFF, 1 ON, 2 INVALID)
+  // reads INVALID at all times since 2026.38. Bit 51 took over, found from
+  // the car's trace: set with the accelerator at 0 while stopping or held at
+  // a stop, clear while driving on it and coasting with regen, and clear in
+  // P with the foot off; bits 48-50 beside it stay 0.
+  'brake': Sig(0x118, 51, 1),
 
-  // ID2E5 FrontInverterPower / ID266 RearInverterPower
-  // Raw 1024 is SNA, which would otherwise read as full regen.
-  'frontKw': Sig(0x2E5, 0, 11, scale: 0.5, signed: true, sna: 1024),
-  'rearKw': Sig(0x266, 0, 11, scale: 0.5, signed: true, sna: 1024),
+  // ID2E5 FrontInverterPower / ID266 RearInverterPower. Firmware 2026.38
+  // repacked both into 7 bytes: the power moved from 0|11 to 41|11, after
+  // the drive power limit (now 32|9: rear 392 kW, front 208). Found from the
+  // car's trace: +4 kW pulling away, -4 kW slowing, 0 parked. The old spot
+  // now reads e.g. -382.5 kW parked. Raw 1024 is SNA, else full regen.
+  'frontKw': Sig(0x2E5, 41, 11, scale: 0.5, signed: true, sna: 1024),
+  'rearKw': Sig(0x266, 41, 11, scale: 0.5, signed: true, sna: 1024),
+  // ID132 BMS_hvBusStatus, ~68 a second: the pack's voltage and current, to
+  // move the motor readouts between those once-a-second frames (see
+  // Panda._blend). Current comes in after voltage: same frame, this order.
+  // Discharge is negative here: battery kW = -V x A (the drive's trace).
+  'packV': Sig(0x132, 0, 16, scale: 0.01),
+  'packA': Sig(0x132, 16, 16, scale: 0.1, signed: true, sna: 32768),
+
+  // What else draws on the pack, beside the motors (see Panda.otherKw). On
+  // the drive's trace compressor + 12 V made up the whole gap to within
+  // ~0.2 kW, the heat pump doing the heating (cabin heater 0).
+  // ID2A7 CMPD_state: the heat pump compressor's HV input power.
+  'compW': Sig(0x2A7, 21, 11, scale: 10), // W
+  // ID2B4 PCS_dcdcRailStatus: the 12 V side, volts then amps (same frame,
+  // this order): everything low-voltage, seat heaters and screens included.
+  'lvV': Sig(0x2B4, 0, 13, scale: 0.01),
+  'lvA': Sig(0x2B4, 32, 13, scale: 0.1, signed: true),
+  // ID2B3 page 2: the cabin's resistive heater per zone.
+  'heatL': Sig(0x2B3, 16, 10, scale: 5, mux: 2, muxLen: 5), // W
+  'heatR': Sig(0x2B3, 26, 10, scale: 5, mux: 2, muxLen: 5), // W
 
   // ID33A UI_rangeSOC. Current firmware packs this tighter than the public
   // DBC: Range 0|10, Wh/mi 10|10, SOC 20|7, uSOE 27|7. Derived from a

@@ -28,7 +28,7 @@ const kWarn = Color(0xFFFFB020);
 /// motor's peak — a 250 kW span never moved off the bottom in traffic.
 /// [regenCapKw]: the most regen the pack takes now (less when cold or
 /// full), red on the regen side past it.
-class RingGauge extends StatelessWidget {
+class RingGauge extends StatefulWidget {
   const RingGauge({
     super.key,
     required this.frontKw,
@@ -36,6 +36,7 @@ class RingGauge extends StatelessWidget {
     this.regenCapKw,
     this.maxKw = 160,
     this.minKw = -60,
+    this.glideAll = true,
     required this.child,
   });
 
@@ -43,25 +44,53 @@ class RingGauge extends StatelessWidget {
   final double maxKw, minKw;
   final Widget child;
 
+  /// Glide on every change. Off, a change under [_jumpKw] lands at once and
+  /// only a jump glides: the screen then redraws as the data comes (30 a
+  /// second) instead of at its full rate, a third less CPU in a replay.
+  final bool glideAll;
+
   @override
-  Widget build(BuildContext context) => TweenAnimationBuilder<_Vals>(
+  State<RingGauge> createState() => _RingGaugeState();
+}
+
+class _RingGaugeState extends State<RingGauge> {
+  static const _glide = Duration(milliseconds: 140);
+  static const _jumpKw = 2.0;
+  DateTime _glideUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  @override
+  void didUpdateWidget(RingGauge old) {
+    super.didUpdateWidget(old);
+    final jump = ((widget.frontKw ?? 0) - (old.frontKw ?? 0)).abs() >= _jumpKw ||
+        ((widget.rearKw ?? 0) - (old.rearKw ?? 0)).abs() >= _jumpKw;
+    // A jump glides, and so does whatever comes while it does: landing at
+    // once mid-glide would be the very jump it smooths.
+    if (jump) _glideUntil = DateTime.now().add(_glide);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final w = widget;
+    final glide = w.glideAll || DateTime.now().isBefore(_glideUntil);
+    return TweenAnimationBuilder<_Vals>(
         tween: _ValsTween(end: _Vals(
-          (frontKw ?? 0).clamp(minKw, maxKw).toDouble(),
-          (rearKw ?? 0).clamp(minKw, maxKw).toDouble(),
+          (w.frontKw ?? 0).clamp(w.minKw, w.maxKw).toDouble(),
+          (w.rearKw ?? 0).clamp(w.minKw, w.maxKw).toDouble(),
         )),
-        duration: const Duration(milliseconds: 140),
+        duration: glide ? _glide : Duration.zero,
         curve: Curves.easeOut,
         builder: (context, v, _) => CustomPaint(
           painter: _RingPainter(
             v,
-            known: (frontKw != null, rearKw != null),
-            cap: regenCapKw,
-            maxKw: maxKw,
-            minKw: minKw,
+            known: (w.frontKw != null, w.rearKw != null),
+            cap: w.regenCapKw,
+            maxKw: w.maxKw,
+            minKw: w.minKw,
           ),
-          child: Center(child: child),
+          child: Center(child: w.child),
         ),
       );
+  }
 }
 
 class _Vals {

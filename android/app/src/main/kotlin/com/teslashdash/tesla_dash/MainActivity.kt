@@ -110,6 +110,8 @@ class MainActivity : FlutterActivity() {
                     )
                     "unbind" -> { unbind(); stopLook?.invoke(); result.success(null) }
                     "wifiOn" -> result.success(wm.isWifiEnabled)
+                    // The app's own external folder: adb reads it, no permission.
+                    "logDir" -> result.success(getExternalFilesDir(null)?.path)
                     "wifiNearby" -> wifiNearby(
                         call.argument<String>("ssid"),
                         call.argument<Int>("ms") ?: 3_000,

@@ -35,6 +35,44 @@ class Panda extends ChangeNotifier {
   double speed = 0; // in the car's display units
   double? frontKw;
   double? rearKw;
+
+  /// The battery's power now, kW (draw positive): motors, climate and 12 V.
+  double? packKw;
+
+  /// What draws on the pack beside the motors, kW: the climate (heat pump
+  /// compressor and cabin heater), the 12 V side, and the rest of the gap
+  /// between the pack and the motors (battery heating, pumps...). WiFi only.
+  double? lvKw;
+  double? _compKw, _heatLKw, _heatRKw, _lvV;
+  double? get climateKw => _compKw == null && _heatLKw == null && _heatRKw == null
+      ? null
+      : (_compKw ?? 0) + (_heatLKw ?? 0) + (_heatRKw ?? 0);
+  double? get otherKw {
+    final aux = _aux;
+    if (aux == null) return null;
+    return max(0, aux - (climateKw ?? 0) - (lvKw ?? 0)).toDouble();
+  }
+  double? _packV, _frontAt, _rearAt, _aux;
+
+  /// The motor frames come about once a second; the pack's every ~15 ms.
+  /// Their gap at each motor frame is what the rest draws (climate, 12 V:
+  /// 1.6-2.8 kW on the drive's trace), so between motor frames the motors
+  /// move by the pack's change, shared as in the last motor frame. Each motor
+  /// frame puts the exact values back.
+  void _offset() {
+    final p = packKw;
+    if (p != null) _aux = p - (_frontAt ?? 0) - (_rearAt ?? 0);
+  }
+
+  void _blend() {
+    final p = packKw, aux = _aux, f = _frontAt, r = _rearAt;
+    if (p == null || aux == null || r == null || _gear == 'P') return;
+    final d = p - aux - (f ?? 0) - r;
+    // Both near zero: the rear pulls away first on this car.
+    final share = (f ?? 0).abs() + r.abs() > 1 ? r.abs() / ((f ?? 0).abs() + r.abs()) : 1.0;
+    rearKw = r + d * share;
+    if (f != null) frontKw = f + d * (1 - share);
+  }
   double? pedalPct;
   double? socPct;
   double? rangeMi;
@@ -287,6 +325,43 @@ class Panda extends ChangeNotifier {
     if (at(108) case final v?) handsOn = v == 15 ? null : v; // as 0x399's
   }
 
+  /// One line for the trace file (main's _traceTick): the link, what the
+  /// dash shows, and the raw sources behind its power and regen readouts.
+  String traceLine() {
+    String raw(int id) => switch (frames[id]) {
+          final f? => '${id.toRadixString(16)}[bus ${f.lastBus}, ${f.count}] ${f.recent.map(hexOf).join(' / ')}',
+          _ => '${id.toRadixString(16)}[none]',
+        };
+    final b = _bt;
+    return 'wifi "$status" ${frameHz}Hz speed ${speedHz}Hz foreign ${foreignHz}Hz resubs $resubscribes live=$wifiLive viaBt=$viaBt gear=$gear speed=$speed '
+        'front=$frontKw rear=$rearKw pack=${packKw?.toStringAsFixed(1)} climate=${climateKw?.toStringAsFixed(2)} 12v=${lvKw?.toStringAsFixed(2)} other=${otherKw?.toStringAsFixed(2)} regenMax=$regenMaxKw | ${raw(0x2E5)} | ${raw(0x266)} | ${raw(0x252)} | '
+        'bt 51=${b?[51]} 53=${b?[53]} 32=${b?[32]} fields=${b?.length} | '
+        'now 118 ${hexOf(frames[0x118]?.data ?? const [])} 2b6 ${hexOf(frames[0x2B6]?.data ?? const [])} '
+        'brake=$braking slippery=$slippery';
+  }
+
+  /// Every signal as decoded from the newest payload that carries it (a
+  /// multiplexed one from its page), and every id's latest payloads with
+  /// bus and length: for the trace, to spot a firmware update moving things.
+  String traceDump() {
+    String num(double v) => v == v.roundToDouble() ? '${v.toInt()}' : v.toStringAsFixed(3);
+    final b = StringBuffer('signals:');
+    for (final e in kSignals.entries) {
+      double? v;
+      for (final d in frames[e.value.id]?.recent.reversed ?? const <List<int>>[]) {
+        if ((v = decode(e.value, d)) != null) break;
+      }
+      b.write(' ${e.key}=${v == null ? '-' : num(v)}');
+    }
+    for (final id in frames.keys.toList()..sort()) {
+      final f = frames[id]!;
+      final last = f.recent.length > 4 ? f.recent.sublist(f.recent.length - 4) : f.recent;
+      b.write('\n  ${id.toRadixString(16).padLeft(3, '0')} bus ${f.lastBus} len ${f.data.length} '
+          'n ${f.count}: ${last.map(hexOf).join(' / ')}');
+    }
+    return '$b';
+  }
+
   double? get range =>
       rangeMi == null ? null : (kph ? rangeMi! * 1.609344 : rangeMi!);
 
@@ -348,6 +423,27 @@ class Panda extends ChangeNotifier {
   DateTime? until;
   DateTime? _wifiOnAt; // the phone's WiFi came on: look for the car quickly
   int frameHz = 0;
+
+  /// Speed frames (0x257) a second. The car sends about 50: well under means
+  /// the Commander is dropping frames and the dash runs behind.
+  int speedHz = 0;
+  int _speedFrames = 0;
+
+  /// Frames a second for ids the dash never asked for, and how often the
+  /// filter was sent again because of them (both in the trace).
+  int foreignHz = 0, _foreign = 0, resubscribes = 0;
+  DateTime _flooded = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// Drive 1 on 2026.38.6: the Commander streamed all ~300 ids (2150 frames/s,
+  /// speed 30 of 50 a second) though the filter went out, while the next
+  /// drive got 37 ids (445/s, speed 45). A flood this size means the filter
+  /// did not take: send it again, at most every 5 s.
+  void _floodCheck(DateTime now) {
+    if (_all || _foreign < 100 || now.difference(_flooded).inSeconds < 5) return;
+    _flooded = now;
+    resubscribes++;
+    _subscribe();
+  }
 
   /// Everything seen per CAN id, for the Diagnostics screen.
   final Map<int, Frame> frames = {};
@@ -612,7 +708,7 @@ class Panda extends ChangeNotifier {
   /// brake or blind-spot glow, pill, warning or lit button.
   void _forget() {
     gear = '—';
-    frameHz = 0;
+    frameHz = speedHz = 0;
     braking = indL = indR = blindL = blindR = false;
     // With Bluetooth carrying the lamps on, the flasher keeps its beat: a
     // reset here would read their next push as a fresh flash.
@@ -647,7 +743,8 @@ class Panda extends ChangeNotifier {
     // Shown only while live, but the Commander's ACK alone makes a new link
     // live before the first frame: never with the last session's figures.
     speed = 0;
-    frontKw = rearKw = pedalPct = null;
+    frontKw = rearKw = pedalPct = packKw = _packV = _frontAt = _rearAt = _aux = null;
+    lvKw = _compKw = _heatLKw = _heatRKw = _lvV = null;
   }
 
   void _send(List<int> bytes) {
@@ -665,6 +762,10 @@ class Panda extends ChangeNotifier {
       _send(const [0x0c]); // Commander: stream every id on every bus
       return;
     }
+    // Clear first (0x18): 0x0f only adds, so a "send all" left on (by
+    // Diagnostics, or any other client) kept every id coming: 353 ids at
+    // 2100 frames/s on 2026.38.6, a third of them dropped, the rest late.
+    _send(const [0x18]);
     var packet = <int>[0x0f];
     for (final id in kSubscribeIds) {
       if (packet.length > 1 + 3 * 42) {
@@ -727,6 +828,14 @@ class Panda extends ChangeNotifier {
         continue;
       }
       if (len < 1 || len > 8) continue;
+      // An id nobody asked for: the Commander is sending everything (see
+      // [_floodCheck]). Counted and dropped here, before the copy and the
+      // signal scan that cost the UI thread most at 2000 frames a second.
+      if (!_all && !_wanted.contains(id)) {
+        _frameCount++;
+        _foreign++;
+        continue;
+      }
       _onFrame(id, bus, data.sublist(o + 8, o + 8 + len));
     }
   }
@@ -737,15 +846,25 @@ class Panda extends ChangeNotifier {
   @visibleForTesting
   void onFrame(int id, int bus, List<int> data) => _onFrame(id, bus, data);
 
+  static final _wanted = kSubscribeIds.toSet();
+  static final _byId = () {
+    final m = <int, List<MapEntry<String, Sig>>>{};
+    for (final e in kSignals.entries) {
+      (m[e.value.id] ??= []).add(e); // keeps kSignals' order, which matters
+    }
+    return m;
+  }();
+
   void _onFrame(int id, int bus, List<int> data) {
     _frameCount++;
+    if (id == 0x257) _speedFrames++;
     final f = frames.putIfAbsent(id, () => Frame(bus));
     f.count++;
+    f.lastBus = bus;
     f.data = data;
     f.remember(data);
 
-    for (final e in kSignals.entries) {
-      if (e.value.id != id) continue;
+    for (final e in _byId[id] ?? const <MapEntry<String, Sig>>[]) {
       final v = decode(e.value, data);
       if (v == null) continue;
       switch (e.key) {
@@ -891,9 +1010,30 @@ class Panda extends ChangeNotifier {
           // headlights or parking lights (CUSTOM light shows excluded).
           drl = v == 15 ? null : v >= 1 && v <= 4;
         case 'frontKw':
-          frontKw = v;
+          frontKw = _frontAt = v;
+          _offset();
         case 'rearKw':
-          rearKw = v;
+          rearKw = _rearAt = v;
+          _offset();
+        case 'compW':
+          _compKw = v / 1000;
+        case 'heatL':
+          _heatLKw = v / 1000;
+        case 'heatR':
+          _heatRKw = v / 1000;
+        case 'lvV':
+          _lvV = v;
+        case 'lvA':
+          final volts = _lvV;
+          if (volts != null) lvKw = volts * v / 1000;
+        case 'packV':
+          _packV = v;
+        case 'packA':
+          final volts = _packV;
+          if (volts != null) {
+            packKw = -volts * v / 1000;
+            _blend();
+          }
         case 'soc':
           socPct = v.clamp(0, 100);
         case 'rangeMi':
@@ -1018,7 +1158,10 @@ class Panda extends ChangeNotifier {
     final now = DateTime.now();
     if (now.difference(_lastHz).inSeconds >= 1) {
       frameHz = _frameCount;
-      _frameCount = 0;
+      speedHz = _speedFrames;
+      foreignHz = _foreign;
+      _floodCheck(now);
+      _frameCount = _speedFrames = _foreign = 0;
       _lastHz = now;
     }
     if (now.difference(_lastPush).inMilliseconds < 33) return;
@@ -1050,8 +1193,9 @@ class Panda extends ChangeNotifier {
 }
 
 class Frame {
-  Frame(this.bus);
+  Frame(this.bus) : lastBus = bus;
   final int bus;
+  int lastBus; // the bus of the latest one: a second bus reusing the id shows here
   int count = 0;
   List<int> data = const [];
 

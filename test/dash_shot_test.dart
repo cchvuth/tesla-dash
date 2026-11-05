@@ -85,7 +85,15 @@ final _shots = <String, (Size, Panda Function())>{
   }),
   // The motorway on Autopilot, the car asking for a hand on the wheel.
   'highway-cruise': (const Size(823.5, 384), () {
+    // The pack (400 V, 113.5 A = 45.4 kW) over the motors' 42: 3.4 kW of
+    // other draws, the compressor's 1.7 and the 12 V side's 0.8 among them.
     final o = _car()
+      ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0])
+      ..onFrame(0x132, 1, [0x40, 0x9C, 0x90, 0xFB, 0, 0])
+      ..onFrame(0x2E5, 1, [0, 0, 0, 0, 0xD0, 0x48, 0])
+      ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x60, 0])
+      ..onFrame(0x2A7, 1, [150, 137, 75, 21, 46, 188, 5, 129])
+      ..onFrame(0x2B4, 1, [183, 5, 88, 14, 34, 2])
       ..speed = 108
       ..gear = 'D'
       ..frontKw = 18

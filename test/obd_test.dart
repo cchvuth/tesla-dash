@@ -57,13 +57,13 @@ void main() {
     final driving = [0, 0, 0x80, 0, 0x64, 0, 0, 0];
     expect(kGears[decode(kSignals['gear']!, driving)!.round()], 'D');
     expect(decode(kSignals['pedal']!, driving), closeTo(40, 0.001));
-    // DI_brakePedalState 19|2: byte 2 = gear << 5 | brake << 3 | state.
-    // INVALID must decode, not be skipped, or the last ON sticks.
-    expect(decode(kSignals['brake']!, [0xA6, 0, 0x8D, 0, 0, 0, 0, 0]), 1); // D, ON
-    expect(decode(kSignals['brake']!, [0x4E, 3, 0x32, 0, 0, 0, 0, 0]), 2); // P, INVALID
+    // Payloads from the car on 2026.38.6: the brake is bit 51.
+    expect(decode(kSignals['brake']!, [0xBD, 0x61, 0x95, 0x30, 0x00, 0xC8, 0xB8, 0xFE]), 1); // D, stopping
+    expect(decode(kSignals['brake']!, [0x6B, 0x64, 0x95, 0x30, 0x13, 0xC8, 0x50, 0xFE]), 0); // D, on the pedal
 
-    // RearPower266 0|11 signed (0.5): -100 raw -> -50 kW of regen.
-    final regen = [0x9C, 0x07, 0, 0, 0, 0, 0, 0]; // 11-bit two's complement
+    // RearPower266 41|11 signed (0.5) since 2026.38: -100 raw -> -50 kW of
+    // regen: 0x79C (11-bit two's complement) << 1 = 0xF38 in bytes 5-6.
+    final regen = [0, 0, 0, 0, 0x88, 0x38 | 0x01, 0x0F]; // keeps the limit's top bit
     expect(decode(kSignals['rearKw']!, regen), -50);
 
     // 0x332 payload 1: max brick 3.900 V (raw 1950 at bit 2), min 3.888 V
@@ -108,17 +108,17 @@ void main() {
 
   test('Panda holds nothing stale and picks the right source', () {
     final p = Panda();
-    // Stopped in D on the brake, then the auto-park's P with INVALID.
-    p.onFrame(0x118, 0, [0xA6, 0, 0x8D, 0, 0, 0, 0, 0]);
+    // Stopped in D on the brake (bit 51), then the auto-park's P.
+    p.onFrame(0x118, 0, [0, 0, 0x80, 0, 0, 0, 0x08, 0]);
     expect(p.braking, isTrue);
-    p.onFrame(0x118, 0, [0x4E, 3, 0x32, 0, 0, 0, 0, 0]);
+    p.onFrame(0x118, 0, [0, 0, 0x20, 0, 0, 0, 0x08, 0]);
     expect(p.braking, isFalse);
-    // INVALID in D clears it too; a press in P never lights it.
-    p.onFrame(0x118, 0, [0, 0, 0x88, 0, 0, 0, 0, 0]);
+    // Off the pedal in D clears it; a press in P never lights it.
+    p.onFrame(0x118, 0, [0, 0, 0x80, 0, 0, 0, 0x08, 0]);
     expect(p.braking, isTrue);
-    p.onFrame(0x118, 0, [0, 0, 0x90, 0, 0, 0, 0, 0]);
+    p.onFrame(0x118, 0, [0, 0, 0x80, 0, 0, 0, 0, 0]);
     expect(p.braking, isFalse);
-    p.onFrame(0x118, 0, [0, 0, 0x28, 0, 0, 0, 0, 0]);
+    p.onFrame(0x118, 0, [0, 0, 0x20, 0, 0, 0, 0x08, 0]);
     expect(p.braking, isFalse);
 
     // Tyres: 0x25A until 0x219 page 5 has a reading; an empty page 5 never
@@ -592,5 +592,79 @@ void main() {
     // the same breath, must not slip through that gap.
     expect(p.trying, isTrue);
     await p.disconnect();
+  });
+
+  test('motor power from the 2026.38 frames, and the trace line behind it', () {
+    // Payloads from the car's trace on 2026.38.6.
+    final p = Panda()
+      ..onFrame(0x266, 1, [0x1A, 0x36, 0x18, 0x00, 0x88, 0x11, 0x00]) // pulling away
+      ..onFrame(0x2E5, 1, [0x03, 0x0D, 0x00, 0x00, 0xD0, 0x00, 0x00]); // front idle
+    expect(p.rearKw, 4.0);
+    expect(p.frontKw, 0.0);
+    p.onFrame(0x266, 2, [0x1B, 0x28, 0x19, 0x00, 0x88, 0xF1, 0x0F]); // slowing, another bus
+    expect(p.rearKw, -4.0);
+    final t = p.traceLine();
+    expect(t, contains('rear=-4.0'));
+    expect(t, contains('266[bus 2, 2] 1A 36 18 00 88 11 00 / 1B 28 19 00 88 F1 0F'));
+    expect(t, contains('252[none]'));
+    expect(t, contains('bt 51=null'));
+  });
+
+  test('the trace dump decodes every signal and lists each id', () {
+    final p = Panda()..onFrame(0x266, 1, [0x1A, 0x36, 0x18, 0x00, 0x88, 0x11, 0x00]);
+    final d = p.traceDump();
+    expect(d, contains(' rearKw=4 '));
+    expect(d, contains(' frontKw=- '));
+    expect(d, contains('\n  266 bus 1 len 7 n 1: 1A 36 18 00 88 11 00'));
+  });
+
+  test('ids nobody asked for are dropped and counted, not decoded', () {
+    Uint8List rec(int id) {
+      final b = ByteData(16)
+        ..setUint32(0, id << 21, Endian.little)
+        ..setUint32(4, 8, Endian.little);
+      return b.buffer.asUint8List();
+    }
+
+    final p = Panda()..onPacket(rec(0x7ff))..onPacket(rec(0x118));
+    expect(p.frames.keys, [0x118]);
+    expect(p.frames.containsKey(0x7ff), isFalse);
+  });
+
+  test('motor power moves with the pack between the slow motor frames', () {
+    // 0x132: V 0|16 x0.01, A 16|16 signed x0.1; discharge negative.
+    List<int> pack(double v, double a) {
+      final av = (a * 10).round() & 0xFFFF, vv = (v * 100).round();
+      return [vv & 0xFF, vv >> 8, av & 0xFF, av >> 8, 0, 0];
+    }
+
+    final p = Panda()
+      ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D
+      ..onFrame(0x132, 1, pack(400, -25)) // 10 kW from the pack
+      ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x11 | 0x00, 0]) // rear 4 kW: aux 6
+      ..onFrame(0x2E5, 1, [0, 0, 0, 0, 0xD0, 0x00, 0]); // front 0
+    expect((p.rearKw, p.frontKw), (4.0, 0.0));
+    p.onFrame(0x132, 1, pack(400, -50)); // 20 kW: the motors take the 10 more
+    expect(p.packKw, 20.0);
+    expect(p.rearKw, closeTo(14.0, 1e-9));
+    expect(p.frontKw, 0.0);
+    p.onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x19, 0]); // the exact 6 kW wins
+    expect(p.rearKw, 6.0);
+  });
+
+  test('other draws: climate, 12 V and the rest of the pack-motor gap', () {
+    final p = Panda()
+      ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D
+      // 400 V, -15 A: 6 kW from the pack.
+      ..onFrame(0x132, 1, [0x40, 0x9C, 0x6A, 0xFF, 0, 0])
+      ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x08, 0]); // rear 2 kW: 4 kW besides
+    expect(p.packKw, closeTo(6.0, 1e-9));
+    // From the car: compressor 1.7 kW; 12 V at 14.63 V x 54.6 A.
+    p
+      ..onFrame(0x2A7, 1, [150, 137, 75, 21, 46, 188, 5, 129])
+      ..onFrame(0x2B4, 1, [183, 5, 88, 14, 34, 2]);
+    expect(p.climateKw, closeTo(1.7, 1e-9));
+    expect(p.lvKw, closeTo(14.63 * 54.6 / 1000, 1e-9));
+    expect(p.otherKw, closeTo(4 - 1.7 - 14.63 * 54.6 / 1000, 1e-9));
   });
 }

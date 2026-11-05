@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show File, FileMode, FileSystemException;
 import 'dart:math' show max, min, pi;
 
 import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform, listEquals;
@@ -80,6 +81,7 @@ class _DashPageState extends State<DashPage> {
   // Bluetooth is back (not with the switch on: it waits for the stream).
   int _settleMs = 1000, _buttonsMs = 0, _rejoinMs = 5000, _backMs = 15000;
   bool _wifiFirst = false; // Bluetooth waits for the WiFi stream, however long
+  bool _smooth = true; // the power ring and pedal line glide on every change
   int _lookMs = 3000; // the slider's look time; with the switch on the look has none
 
   /// What the look waits: the slider's time, or with the switch on, for the
@@ -115,6 +117,7 @@ class _DashPageState extends State<DashPage> {
     _rejoinMs = prefs.getInt('btRejoinMs') ?? _rejoinMs;
     _backMs = prefs.getInt('btBackMs') ?? _backMs;
     _wifiFirst = prefs.getBool('btWifiFirst') ?? _wifiFirst;
+    _smooth = prefs.getBool('smoothRing') ?? _smooth;
     // Inside the slider's range, whatever was stored.
     _lookMs = (prefs.getInt('wifiLookMs') ?? _lookMs).clamp(1000, 10000).toInt();
     _applyLook();
@@ -149,6 +152,7 @@ class _DashPageState extends State<DashPage> {
     _bt.waitFor = _btWaitsFor;
     _connect();
     _bt.connect();
+    _startTrace();
   }
 
   /// Why Bluetooth is not to start a link now, or null ([Commander.waitFor]).
@@ -159,6 +163,42 @@ class _DashPageState extends State<DashPage> {
       : _obd.trying ? 'waiting for WiFi to try first' : null;
 
   Timer? _btBack, _btButtons;
+
+  /// A line a second to trace.log in the app's external files folder, to read
+  /// a drive afterwards over adb:
+  /// adb pull /sdcard/Android/data/com.teslashdash.tesla_dash/files/trace.log
+  /// Rolls to trace.log.1 past 50 MB, so the two stay under 100 MB (about a
+  /// day of driving each).
+  File? _traceFile;
+  Timer? _traceTimer;
+
+  Future<void> _startTrace() async {
+    // ponytail: Android only; iOS would need path_provider and a file-sharing key.
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    try {
+      final dir = await const MethodChannel('tesla_dash/net').invokeMethod<String>('logDir');
+      if (dir == null || !mounted) return;
+      _traceFile = File('$dir/trace.log');
+    } on Exception {
+      return; // no folder (tests): no trace
+    }
+    _trace('start: wifiFirst=$_wifiFirst look=${_lookMs}ms settle=${_settleMs}ms buttons=${_buttonsMs}ms '
+        'data=${_rejoinMs}ms back=${_backMs}ms');
+    _traceTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      _trace('${_obd.traceLine()} | bt ${_bt.link.name} "${_bt.status}" wait=${_btWaitsFor()} push=${_bt.pushInfo}');
+      if (t.tick % 30 == 0 && _obd.frames.isNotEmpty) _trace(_obd.traceDump()); // every signal, twice a minute
+    });
+  }
+
+  void _trace(String line) {
+    final f = _traceFile!;
+    try {
+      if (f.existsSync() && f.lengthSync() > 50 << 20) f.renameSync('${f.path}.1');
+      f.writeAsStringSync('${DateTime.now().toIso8601String()} $line\n', mode: FileMode.append);
+    } on FileSystemException {
+      // a full or missing folder: skip the line
+    }
+  }
   bool _streamSeen = true; // the last step-aside was followed by a stream
 
   /// Before a WiFi stream starts: Bluetooth off the Commander (see
@@ -250,6 +290,7 @@ class _DashPageState extends State<DashPage> {
 
   @override
   void dispose() {
+    _traceTimer?.cancel();
     _btBack?.cancel();
     _btButtons?.cancel();
     _life?.dispose();
@@ -359,7 +400,9 @@ class _DashPageState extends State<DashPage> {
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
-                _obd.wifiLive ? 'Live: ${_obd.frameHz} frames/s from $_host:$_port' : _obd.status,
+                _obd.wifiLive
+                    ? 'Live: ${_obd.speedHz} speed frames/s (the car sends about 50), ${_obd.frameHz} frames/s in all, from $_host:$_port'
+                    : _obd.status,
                 style: const TextStyle(color: Colors.white70)),
           ),
           Row(children: [
@@ -434,6 +477,21 @@ class _DashPageState extends State<DashPage> {
           // so this fallback has nothing to time.
           gap('Bluetooth back if no WiFi stream', _backMs, 30, 'btBackMs',
               (v) => _backMs = v, redraw, on: !_wifiFirst),
+          // Gliding on every change keeps the screen redrawing at its full
+          // rate: a third of the app's CPU in a replayed drive. Off, small
+          // changes land at once and only jumps glide.
+          const SizedBox(height: 8),
+          Row(children: [
+            const Expanded(child: Text('Smooth power ring (more battery)')),
+            Switch(
+              value: _smooth,
+              onChanged: (v) async {
+                redraw(() => _smooth = v);
+                setState(() {});
+                (await SharedPreferences.getInstance()).setBool('smoothRing', v);
+              },
+            ),
+          ]),
         ]),
         actions: [
           // Bluetooth sticks to the Commander it was approved on; this lets
@@ -510,7 +568,7 @@ class _DashPageState extends State<DashPage> {
             // Beside Google Maps, or in any split, the window is about half
             // as wide: the essentials only, laid out for it.
             if (MediaQuery.sizeOf(context).width < 700)
-              SafeArea(child: _Compact(obd: o, bt: _bt))
+              SafeArea(child: _Compact(obd: o, bt: _bt, smooth: _smooth))
             else
               SafeArea(
                 child: Stack(children: [
@@ -523,7 +581,7 @@ class _DashPageState extends State<DashPage> {
                     child: Align(
                       alignment: Alignment.topCenter,
                       child: AnimatedFractionallySizedBox(
-                        duration: const Duration(milliseconds: 140),
+                        duration: _smooth ? const Duration(milliseconds: 140) : Duration.zero,
                         widthFactor: (o.pedalPct ?? 0).clamp(0, 100) / 100,
                         child: Container(height: 4, color: kAccent),
                       ),
@@ -544,6 +602,7 @@ class _DashPageState extends State<DashPage> {
                         AspectRatio(
                           aspectRatio: 1,
                           child: RingGauge(
+                            glideAll: _smooth,
                             frontKw: live ? o.frontKw : null,
                             rearKw: live ? o.rearKw : null,
                             regenCapKw: live && o.gear != 'P' ? o.regenMaxKw : null, // no regen parked
@@ -614,10 +673,11 @@ Widget? _autopilot(Panda o) {
 /// and the route below. Lights, tyres, pack, pedal, the seat map and the
 /// buttons wait for the full screen.
 class _Compact extends StatelessWidget {
-  const _Compact({required this.obd, required this.bt});
+  const _Compact({required this.obd, required this.bt, this.smooth = true});
 
   final Panda obd;
   final Commander bt;
+  final bool smooth; // see RingGauge.glideAll
 
   @override
   Widget build(BuildContext context) {
@@ -672,6 +732,7 @@ class _Compact extends StatelessWidget {
             child: AspectRatio(
               aspectRatio: 1,
               child: RingGauge(
+                glideAll: smooth,
                 frontKw: live ? o.frontKw : null,
                 rearKw: live ? o.rearKw : null,
                 regenCapKw: live && o.gear != 'P' ? o.regenMaxKw : null, // no regen parked

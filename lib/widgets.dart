@@ -216,11 +216,25 @@ class _Nav extends StatelessWidget {
         ?battery,
       ]),
     );
-    if (oneLine) return line;
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      line,
-      if (bt.navDest case final dest?)
-        Row(mainAxisSize: MainAxisSize.min, children: [
+    // On a light grey card, set apart from the link icons and buttons.
+    // As much room above and below as the bar allows: the place's line
+    // under the name takes most of it.
+    Widget card(Widget child) => Container(
+          padding: EdgeInsets.symmetric(horizontal: 12, vertical: bt.navDest == null ? 3 : 1),
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.14),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: child,
+        );
+    if (oneLine) return card(line);
+    return card(Column(mainAxisSize: MainAxisSize.min, children: [
+      // Its name, top centre, with the place beside it once Bluetooth has
+      // one: two lines at most, so the bar grows no taller.
+      Row(mainAxisSize: MainAxisSize.min, children: [
+        const Text('DESTINATION', style: TextStyle(fontSize: 10, height: 1.2, letterSpacing: 1.5, color: Colors.white70)),
+        if (bt.navDest case final dest?) ...[
+          const SizedBox(width: 10),
           const Icon(Icons.place, size: 15, color: Colors.white70),
           const SizedBox(width: 4),
           Flexible(
@@ -230,8 +244,10 @@ class _Nav extends StatelessWidget {
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(fontSize: 15, height: 1.1, color: Colors.white)),
           ),
-        ]),
-    ]);
+        ],
+      ]),
+      line,
+    ]));
   }
 }
 
@@ -392,7 +408,14 @@ class _Controls extends StatelessWidget {
         _LinkButton(
             icon: wIcon, color: wColor, word: wWord, until: obd.until,
             settled: obd.link == WifiLink.live,
-            tip: 'WiFi: ${obd.status}', onTap: onWifi),
+            // Live, the speed frames a second: the car sends about 50, so a
+            // low count is the Commander dropping frames and the dash lagging.
+            stat: obd.link == WifiLink.live ? '${obd.speedHz}' : null,
+            statColor: obd.speedHz >= 40 ? Colors.white : obd.speedHz >= 20 ? kWarn : kAlert,
+            tip: obd.link == WifiLink.live
+                ? 'WiFi: live, ${obd.speedHz} speed frames/s (the car sends about 50), ${obd.frameHz} frames/s in all'
+                : 'WiFi: ${obd.status}',
+            onTap: onWifi),
         _LinkButton(
             icon: bIcon, color: bColor, word: bWord, until: bt.until,
             settled: bt.link == BtLink.lean || bt.link == BtLink.full,
@@ -431,8 +454,13 @@ class _LinkButton extends StatefulWidget {
     required this.settled,
     required this.tip,
     required this.onTap,
+    this.stat,
+    this.statColor = Colors.white,
   });
 
+  /// A small figure under a settled icon.
+  final String? stat;
+  final Color statColor;
   final IconData icon;
   final Color color;
   final String word, tip;
@@ -491,7 +519,19 @@ class _LinkButtonState extends State<_LinkButton> {
           child: widget.settled
               // On the big buttons' icon line (its word below), not the
               // bar's middle, so a small and a big one line up.
-              ? Align(alignment: const Alignment(0, -0.5), child: Icon(widget.icon, size: 18, color: c))
+              ? Align(
+                  alignment: const Alignment(0, -0.5),
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(widget.icon, size: 18, color: c),
+                    if (widget.stat case final s?)
+                      Text(s,
+                          style: TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              height: 1.1,
+                              color: widget.statColor,
+                              fontFeatures: const [FontFeature.tabularFigures()])),
+                  ]))
               // Scaled while the button grows back, so it never spills.
               : FittedBox(fit: BoxFit.scaleDown, child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
             // The icon keeps one place whatever the state: a 28 dp spot at
@@ -1049,6 +1089,15 @@ class _Cabin extends StatelessWidget {
                   ]),
           ),
         ]);
+    Widget draw(String label, double? kw) => Row(mainAxisSize: MainAxisSize.min, children: [
+          SizedBox(
+            width: 46 + 8 + scale(36),
+            child: Text(label, style: const TextStyle(fontSize: 12, letterSpacing: 1, color: Colors.white70)),
+          ),
+          Text(kw == null ? '—' : '${kw.toStringAsFixed(1)} kW',
+              style: const TextStyle(
+                  fontSize: 15, color: Colors.white, fontFeatures: [FontFeature.tabularFigures()])),
+        ]);
     // Shrinks rather than overflows in the column beside the ring.
     return FittedBox(
       fit: BoxFit.scaleDown,
@@ -1068,6 +1117,14 @@ class _Cabin extends StatelessWidget {
           row([seat('D', o.beltDriver), const SizedBox(width: 14), seat('P', o.beltPass)], o.cabinC1, o.fan1),
           row([seat('2L', o.belt2L), seat('2C', o.belt2C), seat('2R', o.belt2R)], o.cabinC2, o.fan2),
           row([seat('3L', o.belt3L), seat('3R', o.belt3R)], o.cabinC3),
+          // What the pack feeds beside the motors, under the climate that
+          // causes most of it.
+          if (o.otherKw != null) ...[
+            const SizedBox(height: 4),
+            draw('CLIMATE', o.climateKw),
+            draw('12 V', o.lvKw),
+            draw('OTHER', o.otherKw),
+          ],
         ]),
       ),
     );
