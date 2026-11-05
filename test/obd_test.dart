@@ -1,6 +1,9 @@
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:tesla_dash/diag.dart';
 import 'package:tesla_dash/panda.dart';
 import 'package:tesla_dash/signals.dart';
 
@@ -610,12 +613,20 @@ void main() {
     expect(t, contains('bt 51=null'));
   });
 
-  test('the trace dump decodes every signal and lists each id', () {
-    final p = Panda()..onFrame(0x266, 1, [0x1A, 0x36, 0x18, 0x00, 0x88, 0x11, 0x00]);
+  test('the trace dump decodes every signal; the report lists each id', () {
+    final p = Panda()
+      ..onFrame(0x266, 1, [0x1A, 0x36, 0x18, 0x00, 0x88, 0x11, 0x00])
+      ..onFrame(0x266, 2, [0x1B, 0x28, 0x19, 0x00, 0x88, 0xF1, 0x0F]); // the same id from another bus
     final d = p.traceDump();
-    expect(d, contains(' rearKw=4 '));
+    expect(d, contains(' rearKw=-4 '));
     expect(d, contains(' frontKw=- '));
-    expect(d, contains('\n  266 bus 1 len 7 n 1: 1A 36 18 00 88 11 00'));
+    final r = diagReport(p, null);
+    expect(r, startsWith('tesla-dash diagnostics '));
+    expect(r, contains('build: unknown')); // no native side in a test
+    expect(r, contains('rear -4.0 kW'));
+    expect(RegExp(r'0x266 +1/2 +\d').hasMatch(r), isTrue); // first bus / latest bus
+    expect(r, contains('1B 28 19 00 88 F1 0F'));
+    expect(r, contains('1A 36 18 00 88 11 00')); // the earlier payload, listed below it
   });
 
   test('ids nobody asked for are dropped and counted, not decoded', () {
@@ -631,40 +642,64 @@ void main() {
     expect(p.frames.containsKey(0x7ff), isFalse);
   });
 
-  test('motor power moves with the pack between the slow motor frames', () {
-    // 0x132: V 0|16 x0.01, A 16|16 signed x0.1; discharge negative.
-    List<int> pack(double v, double a) {
-      final av = (a * 10).round() & 0xFFFF, vv = (v * 100).round();
-      return [vv & 0xFF, vv >> 8, av & 0xFF, av >> 8, 0, 0];
-    }
+  // 0x132: V 0|16 x0.01, A 16|16 signed x0.1; discharge negative.
+  List<int> pack(double v, double a) {
+    final av = (a * 10).round() & 0xFFFF, vv = (v * 100).round();
+    return [vv & 0xFF, vv >> 8, av & 0xFF, av >> 8, 0, 0];
+  }
 
+  test('motor power follows the pack; motor frames only set the share', () {
     final p = Panda()
       ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D
-      ..onFrame(0x132, 1, pack(400, -25)) // 10 kW from the pack
-      ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x11 | 0x00, 0]) // rear 4 kW: aux 6
-      ..onFrame(0x2E5, 1, [0, 0, 0, 0, 0xD0, 0x00, 0]); // front 0
+      ..onFrame(0x132, 1, pack(400, -20)) // 8 kW from the pack
+      ..onFrame(0x2E5, 1, [0, 0, 0, 0, 0xD0, 0x00, 0]) // front 0
+      ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x10, 0]); // rear 4 kW: 4 kW besides
     expect((p.rearKw, p.frontKw), (4.0, 0.0));
-    p.onFrame(0x132, 1, pack(400, -50)); // 20 kW: the motors take the 10 more
-    expect(p.packKw, 20.0);
-    expect(p.rearKw, closeTo(14.0, 1e-9));
+    expect(p.otherKw, 4.0);
+    p.onFrame(0x132, 1, pack(400, -50)); // 20 kW: the motors take the 12 more
+    expect(p.rearKw, closeTo(16.0, 1e-9));
     expect(p.frontKw, 0.0);
-    p.onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x19, 0]); // the exact 6 kW wins
-    expect(p.rearKw, 6.0);
+    // A late motor frame (it lags the pack) no longer pulls the readout
+    // back to its 5 kW: the pack still says 20.
+    p.onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x14, 0]);
+    expect(p.rearKw, closeTo(16.0, 0.1)); // only the averaged rest moved
+    // Parked, the exact values.
+    p.onFrame(0x118, 1, [0, 0, 0x20, 0, 0, 0, 0, 0]);
+    p.onFrame(0x132, 1, pack(400, -50));
+    expect(p.rearKw, 5.0);
   });
 
   test('other draws: climate, 12 V and the rest of the pack-motor gap', () {
     final p = Panda()
       ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D
+      // From the car: compressor 1.7 kW; 12 V at 14.63 V x 54.6 A.
+      ..onFrame(0x2A7, 1, [150, 137, 75, 21, 46, 188, 5, 129])
+      ..onFrame(0x2B4, 1, [183, 5, 88, 14, 34, 2])
       // 400 V, -15 A: 6 kW from the pack.
       ..onFrame(0x132, 1, [0x40, 0x9C, 0x6A, 0xFF, 0, 0])
       ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x08, 0]); // rear 2 kW: 4 kW besides
     expect(p.packKw, closeTo(6.0, 1e-9));
-    // From the car: compressor 1.7 kW; 12 V at 14.63 V x 54.6 A.
-    p
-      ..onFrame(0x2A7, 1, [150, 137, 75, 21, 46, 188, 5, 129])
-      ..onFrame(0x2B4, 1, [183, 5, 88, 14, 34, 2]);
     expect(p.climateKw, closeTo(1.7, 1e-9));
     expect(p.lvKw, closeTo(14.63 * 54.6 / 1000, 1e-9));
     expect(p.otherKw, closeTo(4 - 1.7 - 14.63 * 54.6 / 1000, 1e-9));
+    expect(p.rearKw, closeTo(2.0, 1e-9)); // pack less the rest, all at the rear
+  });
+
+  test('the copied log is the share file\'s end, from a whole line, report last', () async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    final dir = Directory.systemTemp.createTempSync('trace');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('tesla_dash/net'), (call) async => call.method == 'logDir' ? dir.path : null);
+    addTearDown(() => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(const MethodChannel('tesla_dash/net'), null));
+    File('${dir.path}/trace.log').writeAsStringSync(
+        [for (var i = 0; i < 400; i++) '2026-11-06T10:00:00 line $i ${'x' * 90}'].join('\n'));
+    final t = await traceTail('REPORT', bytes: 5000);
+    expect(t.length, lessThan(5100));
+    expect(t, startsWith('2026-11-06T10:00:00 line ')); // not cut mid-line
+    expect(t.trimRight(), endsWith('REPORT'));
+    expect(t, contains('line 399')); // the newest lines are the ones kept
+    expect(t, isNot(contains('line 0 ')));
   });
 }

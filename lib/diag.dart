@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -14,6 +15,121 @@ import 'signals.dart';
 /// Everything needed to debug the link from the passenger seat: every CAN
 /// id the Commander will stream, decoded values, TCP port probes, and a
 /// one-tap log to paste back.
+/// The version this app is: name, commit, a "+" if built from uncommitted
+/// changes, and build time. Set at startup ([loadBuild]); empty off Android.
+String diagBuild = '';
+
+Future<void> loadBuild() async {
+  try {
+    diagBuild = await const MethodChannel('tesla_dash/net').invokeMethod<String>('buildInfo') ?? '';
+  } on MissingPluginException {
+    // no native side (tests, iOS): unknown
+  }
+}
+
+/// The Diagnostics report: what the dash decoded, the Commander, and every
+/// CAN id with its rate and recent payloads. One text for the Copy log button,
+/// the trace file's export and its half-minute block.
+String diagReport(Panda o, Commander? bt, {bool captureAll = false, String extra = ''}) {
+    final secs = DateTime.now().difference(o.captureStart).inMilliseconds / 1000;
+    final ids = o.frames.keys.toList()..sort();
+    final b = StringBuffer()
+      ..writeln('tesla-dash diagnostics ${DateTime.now().toIso8601String()}')
+      ..writeln('build: ${diagBuild.isEmpty ? 'unknown' : diagBuild}')
+      ..writeln('platform: ${Platform.operatingSystem} ${Platform.operatingSystemVersion}')
+      ..writeln('link: ${o.status}, ${o.frameHz} frames/s, capture-all: $captureAll, '
+          '${secs.toStringAsFixed(0)} s, ${ids.length} ids')
+      ..writeln()
+      ..writeln('decoded:')
+      ..writeln('  speed ${o.speed} ${o.speedUnit}  gear ${o.gear}  '
+          'pedal ${o.pedalPct}  brake ${o.braking}')
+      ..writeln('  front ${o.frontKw} kW  rear ${o.rearKw} kW')
+      ..writeln('  soc ${o.socPct} %  range ${o.rangeMi} mi  limit ${o.speedLimit}')
+      ..writeln('  lights low ${o.lowBeam} high ${o.highBeam} drl ${o.drl}')
+      ..writeln('  tyres bar ${o.tpFL} ${o.tpFR} ${o.tpRL} ${o.tpRR}')
+      ..writeln('  belts ${o.beltDriver} ${o.beltPass} / ${o.belt2L} ${o.belt2C} '
+          '${o.belt2R} / ${o.belt3L} ${o.belt3R}  buckled ${o.buckled.join(' ')}  '
+          'fans ${o.fan1} ${o.fan2} (auto ${o.autoBlower})')
+      ..writeln('  grip ${o.gripBits}')
+      ..writeln('  g along ${o.gLong?.toStringAsFixed(2)} across ${o.gLat?.toStringAsFixed(2)}  '
+          'peaks accel ${o.gMaxAccel.toStringAsFixed(2)} brake ${o.gMaxBrake.toStringAsFixed(2)} '
+          'lat ${o.gMaxLat.toStringAsFixed(2)}')
+      ..writeln('  map lights ${o.mapLight} dome ${o.domeLight}')
+      ..writeln('  port ${o.chargePort}  tilt auto ${o.tiltAuto} dipped ${o.mirrorDipped}  '
+          'air ${o.recirc} hvac ${o.hvacOn} recirculating ${o.recircOn}')
+      ..writeln('  nav route ${o.navRoute} ${o.navMinutes} min ${o.navEnergyKwh} kWh')
+      ..writeln('commander: ${bt?.pushInfo}, ${bt?.pushCount} pushes, '
+          '${bt?.carLink} [${bt?.carLinkRaw}]; last push ${bt?.lastPush}')
+      ..writeln('commander fields pushed: '
+          '${(bt?.pushFields.toList() ?? [])..sort()}')
+      ..writeln('commander dash ${bt?.dash} [${bt?.dashInfoRaw}]')
+      ..writeln('commander: ${bt?.status}  recirc ${bt?.recircMode}  '
+          'nav ${bt?.navMinutes} min ${bt?.navMiles} mi '
+          '${bt?.navArrivePct} % ${bt?.navDest}')
+      ..writeln()
+      ..write(extra)
+      ..writeln('subscribed ids: ${kSubscribeIds.map(_idHex).join(' ')}')
+      ..writeln()
+      ..writeln('id     bus  hz     data');
+    for (final id in ids) {
+      final f = o.frames[id]!;
+      b.writeln('${_idHex(id)}  ${(f.bus == f.lastBus ? '${f.bus}' : '${f.bus}/${f.lastBus}').padLeft(3)}  '
+          '${(f.count / secs).toStringAsFixed(1).padLeft(5)}  ${f.hex}');
+      // The dash's own ids also list their other recent payloads, newest
+      // first: a multiplexed frame's pages.
+      if (kSubscribeIds.contains(id)) {
+        for (final r in f.recent.reversed.skip(1)) {
+          b.writeln('${' ' * 19}${hexOf(r)}');
+        }
+      }
+    }
+    return b.toString();
+  }
+
+String _idHex(int id) => '0x${id.toRadixString(16).toUpperCase().padLeft(3, '0')}';
+
+/// The trace log with [report] appended: the one file the share sheet, Copy
+/// log and adb all read. Null where there is none (not Android).
+Future<File?> _traceWith(String report) async {
+  const ch = MethodChannel('tesla_dash/net');
+  final String? dir;
+  try {
+    dir = await ch.invokeMethod<String>('logDir');
+  } on MissingPluginException {
+    return null;
+  }
+  if (dir == null) return null;
+  final f = File('$dir/trace.log');
+  f.writeAsStringSync('${DateTime.now().toIso8601String()} export:\n$report\n', mode: FileMode.append);
+  return f;
+}
+
+/// Opens the share sheet for the trace log, [report] added to its end.
+Future<bool> shareTrace(String report) async {
+  final f = await _traceWith(report);
+  if (f == null) return false;
+  return await const MethodChannel('tesla_dash/net').invokeMethod<bool>('shareLog', {'path': f.path}) ?? false;
+}
+
+/// The end of the same trace log as text, as much as the clipboard takes:
+/// Android's carries about 1 MB, half a million characters, so 240 KB to
+/// start with, halved while the phone refuses. Just [report] where there is
+/// no log. Starts on a line, never mid-way.
+Future<String> traceTail(String report, {int bytes = 240000}) async {
+  final f = await _traceWith(report);
+  if (f == null) return report;
+  final len = f.lengthSync();
+  final n = len < bytes ? len : bytes;
+  final raf = f.openSync();
+  try {
+    raf.setPositionSync(len - n);
+    final text = utf8.decode(raf.readSync(n), allowMalformed: true);
+    return len > n ? text.substring(text.indexOf('\n') + 1) : text;
+  } finally {
+    raf.closeSync();
+  }
+}
+
 class DiagPage extends StatefulWidget {
   const DiagPage({super.key, required this.obd, this.bt});
 
@@ -273,73 +389,15 @@ class _DiagPageState extends State<DiagPage> {
       .map((x) => x.toRadixString(16).padLeft(2, '0'))
       .join(' ');
 
-  String _log() {
-    final o = widget.obd;
-    final secs = DateTime.now().difference(o.captureStart).inMilliseconds / 1000;
-    final ids = o.frames.keys.toList()..sort();
-    final b = StringBuffer()
-      ..writeln('tesla-dash diagnostics ${DateTime.now().toIso8601String()}')
-      ..writeln('platform: ${Platform.operatingSystem} ${Platform.operatingSystemVersion}')
-      ..writeln('link: ${o.status}, ${o.frameHz} frames/s, capture-all: $_all, '
-          '${secs.toStringAsFixed(0)} s, ${ids.length} ids')
-      ..writeln()
-      ..writeln('decoded:')
-      ..writeln('  speed ${o.speed} ${o.speedUnit}  gear ${o.gear}  '
-          'pedal ${o.pedalPct}  brake ${o.braking}')
-      ..writeln('  front ${o.frontKw} kW  rear ${o.rearKw} kW')
-      ..writeln('  soc ${o.socPct} %  range ${o.rangeMi} mi  limit ${o.speedLimit}')
-      ..writeln('  lights low ${o.lowBeam} high ${o.highBeam} drl ${o.drl}')
-      ..writeln('  tyres bar ${o.tpFL} ${o.tpFR} ${o.tpRL} ${o.tpRR}')
-      ..writeln('  belts ${o.beltDriver} ${o.beltPass} / ${o.belt2L} ${o.belt2C} '
-          '${o.belt2R} / ${o.belt3L} ${o.belt3R}  buckled ${o.buckled.join(' ')}  '
-          'fans ${o.fan1} ${o.fan2} (auto ${o.autoBlower})')
-      ..writeln('  grip ${o.gripBits}')
-      ..writeln('  g along ${o.gLong?.toStringAsFixed(2)} across ${o.gLat?.toStringAsFixed(2)}  '
-          'peaks accel ${o.gMaxAccel.toStringAsFixed(2)} brake ${o.gMaxBrake.toStringAsFixed(2)} '
-          'lat ${o.gMaxLat.toStringAsFixed(2)}')
-      ..writeln('  map lights ${o.mapLight} dome ${o.domeLight}')
-      ..writeln('  port ${o.chargePort}  tilt auto ${o.tiltAuto} dipped ${o.mirrorDipped}  '
-          'air ${o.recirc} hvac ${o.hvacOn} recirculating ${o.recircOn}')
-      ..writeln('  nav route ${o.navRoute} ${o.navMinutes} min ${o.navEnergyKwh} kWh')
-      ..writeln('commander: ${widget.bt?.pushInfo}, ${widget.bt?.pushCount} pushes, '
-          '${widget.bt?.carLink} [${widget.bt?.carLinkRaw}]; last push ${widget.bt?.lastPush}')
-      ..writeln('commander fields pushed: '
-          '${(widget.bt?.pushFields.toList() ?? [])..sort()}')
-      ..writeln('commander dash ${widget.bt?.dash} [${widget.bt?.dashInfoRaw}]')
-      ..writeln('commander: ${widget.bt?.status}  recirc ${widget.bt?.recircMode}  '
-          'nav ${widget.bt?.navMinutes} min ${widget.bt?.navMiles} mi '
-          '${widget.bt?.navArrivePct} % ${widget.bt?.navDest}')
-      ..writeln()
-      ..writeln('tyre pressure search:')
-      ..writeln(_pressure.isEmpty ? '  (not run)' : _pressure)
-      ..writeln('nav search:')
-      ..writeln(_nav.isEmpty ? '  (not run)' : _nav)
-      ..writeln()
-      ..writeln('probes:')
-      ..writeln(_probes.isEmpty ? '  (not run)' : _probes.map((p) => '  $p').join('\n'))
-      ..writeln()
-      ..writeln('ble scan (${_ble.length} devices):')
-      ..writeln(_ble.isEmpty ? '  (not run)' : _ble.values.map((d) => '  $d').join('\n'))
-      ..writeln()
-      ..writeln('subscribed ids: ${kSubscribeIds.map(_id).join(' ')}')
-      ..writeln()
-      ..writeln('id     bus  hz     data');
-    for (final id in ids) {
-      final f = o.frames[id]!;
-      b.writeln('${_id(id)}  ${f.bus.toString().padLeft(3)}  '
-          '${(f.count / secs).toStringAsFixed(1).padLeft(5)}  ${f.hex}');
-      // The dash's own ids also list their other recent payloads, newest
-      // first: a multiplexed frame's pages.
-      if (kSubscribeIds.contains(id)) {
-        for (final r in f.recent.reversed.skip(1)) {
-          b.writeln('${' ' * 19}${hexOf(r)}');
-        }
-      }
-    }
-    return b.toString();
-  }
+  String _log() => diagReport(widget.obd, widget.bt,
+      captureAll: _all,
+      extra: 'tyre pressure search:\n${_pressure.isEmpty ? '  (not run)' : _pressure}\n'
+          'nav search:\n${_nav.isEmpty ? '  (not run)' : _nav}\n\n'
+          'probes:\n${_probes.isEmpty ? '  (not run)' : _probes.map((p) => '  $p').join('\n')}\n\n'
+          'ble scan (${_ble.length} devices):\n'
+          '${_ble.isEmpty ? '  (not run)' : _ble.values.map((d) => '  $d').join('\n')}\n\n');
 
-  String _id(int id) => '0x${id.toRadixString(16).toUpperCase().padLeft(3, '0')}';
+  String _id(int id) => _idHex(id);
 
   @override
   Widget build(BuildContext context) {
@@ -350,14 +408,38 @@ class _DiagPageState extends State<DiagPage> {
       appBar: AppBar(
         title: const Text('Diagnostics'),
         actions: [
+          if (Platform.isAndroid)
+            IconButton(
+              icon: const Icon(Icons.ios_share),
+              tooltip: 'Share the trace log (every second, all drives)',
+              onPressed: () async {
+                final ok = await shareTrace(_log());
+                if (!ok && context.mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(const SnackBar(content: Text('No trace log to share')));
+                }
+              },
+            ),
           IconButton(
             icon: const Icon(Icons.copy),
-            tooltip: 'Copy log',
+            tooltip: 'Copy the end of the trace log',
             onPressed: () async {
-              await Clipboard.setData(ClipboardData(text: _log()));
+              // The trace log's end, as much as the clipboard takes.
+              var bytes = 240000;
+              String text;
+              while (true) {
+                text = await traceTail(_log(), bytes: bytes);
+                try {
+                  await Clipboard.setData(ClipboardData(text: text));
+                  break;
+                } on PlatformException {
+                  if (bytes <= 20000) rethrow;
+                  bytes ~/= 2;
+                }
+              }
               if (context.mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Log copied — paste it anywhere')));
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                    content: Text('Copied the last ${(text.length / 1000).round()} KB of the trace log')));
               }
             },
           ),

@@ -47,32 +47,43 @@ class Panda extends ChangeNotifier {
   double? get climateKw => _compKw == null && _heatLKw == null && _heatRKw == null
       ? null
       : (_compKw ?? 0) + (_heatLKw ?? 0) + (_heatRKw ?? 0);
-  double? get otherKw {
-    final aux = _aux;
-    if (aux == null) return null;
-    return max(0, aux - (climateKw ?? 0) - (lvKw ?? 0)).toDouble();
-  }
-  double? _packV, _frontAt, _rearAt, _aux;
+  /// The rest of what the pack feeds (battery heating, pumps...): averaged
+  /// slowly, as the motor frames it comes from run behind the pack.
+  double? get otherKw => _other;
+  double? _packV, _frontAt, _rearAt, _other;
 
-  /// The motor frames come about once a second; the pack's every ~15 ms.
-  /// Their gap at each motor frame is what the rest draws (climate, 12 V:
-  /// 1.6-2.8 kW on the drive's trace), so between motor frames the motors
-  /// move by the pack's change, shared as in the last motor frame. Each motor
-  /// frame puts the exact values back.
-  void _offset() {
+  /// The motor frames come about once a second and run about a second behind
+  /// the pack's (~100 a second): on a drive's trace they matched the pack a
+  /// second earlier best (median 1.3 kW off, against 2.2 kW now). So the
+  /// motors shown are the pack now less what else it feeds (measured climate
+  /// and 12 V, and the averaged rest), shared front and rear as in the last
+  /// motor frame. A motor frame only resets that share and nudges the rest:
+  /// putting its value up would pull the readout a second back.
+  void _motorFrame() {
     final p = packKw;
-    if (p != null) _aux = p - (_frontAt ?? 0) - (_rearAt ?? 0);
+    if (p == null || _rearAt == null) return; // the rear reports first on this car
+    final rest = (p - (_frontAt ?? 0) - (_rearAt ?? 0) - (climateKw ?? 0) - (lvKw ?? 0)).clamp(0, 5).toDouble();
+    final o = _other;
+    _other = o == null ? rest : o + (rest - o) * 0.05; // about 20 frames' worth
   }
+
+  /// The exact motor values in P, or before the pack has been heard.
+  bool get _exact => packKw == null || _other == null || _gear == 'P';
 
   void _blend() {
-    final p = packKw, aux = _aux, f = _frontAt, r = _rearAt;
-    if (p == null || aux == null || r == null || _gear == 'P') return;
-    final d = p - aux - (f ?? 0) - r;
+    final p = packKw, other = _other, f = _frontAt, r = _rearAt;
+    if (_exact || p == null || other == null || r == null) {
+      frontKw = f;
+      rearKw = r;
+      return;
+    }
+    final motors = p - (climateKw ?? 0) - (lvKw ?? 0) - other;
     // Both near zero: the rear pulls away first on this car.
     final share = (f ?? 0).abs() + r.abs() > 1 ? r.abs() / ((f ?? 0).abs() + r.abs()) : 1.0;
-    rearKw = r + d * share;
-    if (f != null) frontKw = f + d * (1 - share);
+    rearKw = motors * share;
+    if (f != null) frontKw = motors * (1 - share);
   }
+
   double? pedalPct;
   double? socPct;
   double? rangeMi;
@@ -341,8 +352,8 @@ class Panda extends ChangeNotifier {
   }
 
   /// Every signal as decoded from the newest payload that carries it (a
-  /// multiplexed one from its page), and every id's latest payloads with
-  /// bus and length: for the trace, to spot a firmware update moving things.
+  /// multiplexed one from its page): for the trace, to spot a firmware
+  /// update moving things. The ids' payloads come with the Diagnostics report.
   String traceDump() {
     String num(double v) => v == v.roundToDouble() ? '${v.toInt()}' : v.toStringAsFixed(3);
     final b = StringBuffer('signals:');
@@ -352,12 +363,6 @@ class Panda extends ChangeNotifier {
         if ((v = decode(e.value, d)) != null) break;
       }
       b.write(' ${e.key}=${v == null ? '-' : num(v)}');
-    }
-    for (final id in frames.keys.toList()..sort()) {
-      final f = frames[id]!;
-      final last = f.recent.length > 4 ? f.recent.sublist(f.recent.length - 4) : f.recent;
-      b.write('\n  ${id.toRadixString(16).padLeft(3, '0')} bus ${f.lastBus} len ${f.data.length} '
-          'n ${f.count}: ${last.map(hexOf).join(' / ')}');
     }
     return '$b';
   }
@@ -743,7 +748,7 @@ class Panda extends ChangeNotifier {
     // Shown only while live, but the Commander's ACK alone makes a new link
     // live before the first frame: never with the last session's figures.
     speed = 0;
-    frontKw = rearKw = pedalPct = packKw = _packV = _frontAt = _rearAt = _aux = null;
+    frontKw = rearKw = pedalPct = packKw = _packV = _frontAt = _rearAt = _other = null;
     lvKw = _compKw = _heatLKw = _heatRKw = _lvV = null;
   }
 
@@ -766,6 +771,12 @@ class Panda extends ChangeNotifier {
     // Diagnostics, or any other client) kept every id coming: 353 ids at
     // 2100 frames/s on 2026.38.6, a third of them dropped, the rest late.
     _send(const [0x18]);
+    // The full list below holds them all; the schedule trims them again.
+    _sparseOn.clear();
+    for (final t in _sparseTimers.values) {
+      t.cancel();
+    }
+    _sparseTimers.clear();
     var packet = <int>[0x0f];
     for (final id in kSubscribeIds) {
       if (packet.length > 1 + 3 * 42) {
@@ -776,6 +787,53 @@ class Panda extends ChangeNotifier {
     }
     if (packet.length > 1) _send(packet);
   }
+
+  /// Ids whose data changes slowly, polled in a short window every N seconds
+  /// rather than streamed: seat belts and their buckles every 2 s, the frunk
+  /// and charge port every 5 s, and those two only while parked (neither can
+  /// change in gear, and their 64 frames/s were the biggest burst). Added with
+  /// 0x0f, removed with 0x0e (the wiki's pair). The values keep their last
+  /// reading between polls. A drive showed the cost of a burst: speed frames
+  /// fell about a quarter of the burst's size in the second it came, so the
+  /// window is 0.4 s, not a second.
+  static const _sparse = <int, List<int>>{
+    2: [0x3C2, 0x3A1, 0x31A], // belts and their buckles, battery heating
+    5: [0x2E1, 0x25D], // frunk, charge port: parked only
+  };
+  static const _parkedOnly = {5};
+  static const _pollWindow = Duration(milliseconds: 400);
+  final _sparseOn = <int, bool>{}; // per period: its ids are subscribed now
+  final _sparseTimers = <int, Timer>{};
+  int _sparseT = 0;
+
+  void _sparseTick() {
+    if (_all) return;
+    _sparseT++;
+    for (final MapEntry(key: n, value: ids) in _sparse.entries) {
+      final on = _sparseOn[n] ?? true;
+      final due = _sparseT % n == 0 && (!_parkedOnly.contains(n) || _gear == 'P');
+      if (due) {
+        if (!on) {
+          _sparseOn[n] = true;
+          _sendIds(0x0f, ids);
+        }
+        // Off again after the window.
+        _sparseTimers[n]?.cancel();
+        _sparseTimers[n] = Timer(_pollWindow, () {
+          if (_sparseOn[n] ?? true) {
+            _sparseOn[n] = false;
+            _sendIds(0x0e, ids);
+          }
+        });
+      } else if (on && !(_sparseTimers[n]?.isActive ?? false)) {
+        _sparseOn[n] = false; // after a full subscribe, or the car left P
+        _sendIds(0x0e, ids);
+      }
+    }
+  }
+
+  void _sendIds(int op, List<int> ids) =>
+      _send([op, for (final id in ids) ...[0xff, id >> 8, id & 0xff]]);
 
   void _tick() {
     // An awake car sends hundreds of frames a second, so a few silent
@@ -788,6 +846,7 @@ class Panda extends ChangeNotifier {
       _scheduleRetry(_lastRecv == null ? 'Commander not answering' : 'link lost');
       return;
     }
+    _sparseTick();
     _hello();
     if (since.inSeconds >= 3 && _lastRecv != null) {
       _set(WifiLink.quiet, 'link quiet — resubscribing', _lastRecv!.add(const Duration(seconds: 8)));
@@ -1010,11 +1069,13 @@ class Panda extends ChangeNotifier {
           // headlights or parking lights (CUSTOM light shows excluded).
           drl = v == 15 ? null : v >= 1 && v <= 4;
         case 'frontKw':
-          frontKw = _frontAt = v;
-          _offset();
+          _frontAt = v;
+          _motorFrame();
+          _blend();
         case 'rearKw':
-          rearKw = _rearAt = v;
-          _offset();
+          _rearAt = v;
+          _motorFrame();
+          _blend();
         case 'compW':
           _compKw = v / 1000;
         case 'heatL':
@@ -1154,6 +1215,10 @@ class Panda extends ChangeNotifier {
   }
 
   // ~30 Hz repaint. Notifying per frame would just drop frames elsewhere.
+  /// The shortest gap between two redraws, ms: 22 is about 45 a second (was
+  /// 33, 30 a second). A replayed drive cost ~3% of a core more at 60.
+  static const pushMs = 22;
+
   void _push() {
     final now = DateTime.now();
     if (now.difference(_lastHz).inSeconds >= 1) {
@@ -1164,7 +1229,7 @@ class Panda extends ChangeNotifier {
       _frameCount = _speedFrames = _foreign = 0;
       _lastHz = now;
     }
-    if (now.difference(_lastPush).inMilliseconds < 33) return;
+    if (now.difference(_lastPush).inMilliseconds < pushMs) return;
     _lastPush = now;
     status = 'live';
     until = null;

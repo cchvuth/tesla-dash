@@ -182,11 +182,13 @@ class _DashPageState extends State<DashPage> {
     } on Exception {
       return; // no folder (tests): no trace
     }
-    _trace('start: wifiFirst=$_wifiFirst look=${_lookMs}ms settle=${_settleMs}ms buttons=${_buttonsMs}ms '
+    await loadBuild();
+    _trace('start: build=$diagBuild wifiFirst=$_wifiFirst look=${_lookMs}ms settle=${_settleMs}ms buttons=${_buttonsMs}ms '
         'data=${_rejoinMs}ms back=${_backMs}ms');
     _traceTimer = Timer.periodic(const Duration(seconds: 1), (t) {
       _trace('${_obd.traceLine()} | bt ${_bt.link.name} "${_bt.status}" wait=${_btWaitsFor()} push=${_bt.pushInfo}');
-      if (t.tick % 30 == 0 && _obd.frames.isNotEmpty) _trace(_obd.traceDump()); // every signal, twice a minute
+      // Twice a minute the whole Diagnostics report and every signal.
+      if (t.tick % 30 == 0 && _obd.frames.isNotEmpty) _trace('${_obd.traceDump()}\n${diagReport(_obd, _bt)}');
     });
   }
 

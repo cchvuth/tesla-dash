@@ -1,7 +1,23 @@
+import java.text.SimpleDateFormat
+import java.util.Date
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+// A stamp for the app's log (versionName's tail): the commit, a "+" while the
+// tree has uncommitted changes, and the build's date and time, so every build
+// tells itself apart, whoever makes it.
+val buildStamp: String = run {
+    fun git(vararg a: String): String = try {
+        ProcessBuilder("git", *a).directory(rootDir).redirectErrorStream(true).start()
+            .inputStream.bufferedReader().readText().trim()
+    } catch (e: Exception) { "" }
+    val dirty = if (git("status", "--porcelain").isNotEmpty()) "+" else ""
+    git("rev-parse", "--short", "HEAD").ifEmpty { "nogit" } + dirty + "-" +
+        SimpleDateFormat("MMdd-HHmm").format(Date())
 }
 
 android {
@@ -27,6 +43,7 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        versionNameSuffix = "-$buildStamp"
     }
 
     buildTypes {

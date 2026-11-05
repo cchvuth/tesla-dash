@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the log share may hand out: the app's own external files folder,
+     where the trace log lives. -->
+<paths>
+    <external-files-path name="logs" path="." />
+</paths>

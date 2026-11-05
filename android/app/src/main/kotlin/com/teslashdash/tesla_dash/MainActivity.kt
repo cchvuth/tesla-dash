@@ -21,6 +21,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import androidx.core.content.FileProvider
+import java.io.File
 import android.view.Surface
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
@@ -112,6 +114,24 @@ class MainActivity : FlutterActivity() {
                     "wifiOn" -> result.success(wm.isWifiEnabled)
                     // The app's own external folder: adb reads it, no permission.
                     "logDir" -> result.success(getExternalFilesDir(null)?.path)
+                    // versionName with the build's stamp (see build.gradle.kts).
+                    "buildInfo" -> result.success(packageManager.getPackageInfo(packageName, 0).versionName)
+                    // The share sheet for one file in that folder (the trace log).
+                    "shareLog" -> {
+                        val f = File(call.argument<String>("path") ?: "")
+                        if (!f.isFile) return@setMethodCallHandler result.success(false)
+                        val uri = FileProvider.getUriForFile(this, "$packageName.logs", f)
+                        startActivity(
+                            Intent.createChooser(
+                                Intent(Intent.ACTION_SEND)
+                                    .setType("text/plain")
+                                    .putExtra(Intent.EXTRA_STREAM, uri)
+                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                                "Share the trace log",
+                            )
+                        )
+                        result.success(true)
+                    }
                     "wifiNearby" -> wifiNearby(
                         call.argument<String>("ssid"),
                         call.argument<Int>("ms") ?: 3_000,

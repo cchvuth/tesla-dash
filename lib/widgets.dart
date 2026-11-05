@@ -408,10 +408,11 @@ class _Controls extends StatelessWidget {
         _LinkButton(
             icon: wIcon, color: wColor, word: wWord, until: obd.until,
             settled: obd.link == WifiLink.live,
-            // Live, the speed frames a second: the car sends about 50, so a
-            // low count is the Commander dropping frames and the dash lagging.
+            // Live, the speed frames a second: the screen redraws up to 45 a
+            // second, so under ~36 the dash waits on the Commander (the car
+            // sends about 50).
             stat: obd.link == WifiLink.live ? '${obd.speedHz}' : null,
-            statColor: obd.speedHz >= 40 ? Colors.white : obd.speedHz >= 20 ? kWarn : kAlert,
+            statColor: obd.speedHz >= 36 ? Colors.white : obd.speedHz >= 18 ? kWarn : kAlert,
             tip: obd.link == WifiLink.live
                 ? 'WiFi: live, ${obd.speedHz} speed frames/s (the car sends about 50), ${obd.frameHz} frames/s in all'
                 : 'WiFi: ${obd.status}',
