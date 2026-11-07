@@ -320,7 +320,7 @@ void main() {
     expect(p.rangeAt(58.61), closeTo(301.2, 0.1));
 
     // Pushes carry what changed; the rest holds, as it does through SNA.
-    p.fromBt({66: 1, 113: 0, 62: 255, 51: 2047});
+    p.fromBt({66: 1, 113: 0, 62: 255, 51: 2047, 53: 0});
     expect((p.gear, p.speed, p.parked), ('P', 87, true));
     expect((p.doorFL, p.pedalPct, p.frontKw), (true, 50, 15.5));
 
@@ -600,6 +600,7 @@ void main() {
   test('motor power from the 2026.38 frames, and the trace line behind it', () {
     // Payloads from the car's trace on 2026.38.6.
     final p = Panda()
+      ..speed = 30
       ..onFrame(0x266, 1, [0x1A, 0x36, 0x18, 0x00, 0x88, 0x11, 0x00]) // pulling away
       ..onFrame(0x2E5, 1, [0x03, 0x0D, 0x00, 0x00, 0xD0, 0x00, 0x00]); // front idle
     expect(p.rearKw, 4.0);
@@ -610,11 +611,12 @@ void main() {
     expect(t, contains('rear=-4.0'));
     expect(t, contains('266[bus 2, 2] 1A 36 18 00 88 11 00 / 1B 28 19 00 88 F1 0F'));
     expect(t, contains('252[none]'));
-    expect(t, contains('bt 51=null'));
+    expect(t, contains('| bt - |')); // no Bluetooth data: a dash
   });
 
   test('the trace dump decodes every signal; the report lists each id', () {
     final p = Panda()
+      ..speed = 30
       ..onFrame(0x266, 1, [0x1A, 0x36, 0x18, 0x00, 0x88, 0x11, 0x00])
       ..onFrame(0x266, 2, [0x1B, 0x28, 0x19, 0x00, 0x88, 0xF1, 0x0F]); // the same id from another bus
     final d = p.traceDump();
@@ -651,6 +653,7 @@ void main() {
   test('motor power follows the pack; motor frames only set the share', () {
     final p = Panda()
       ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D
+      ..speed = 30
       ..onFrame(0x132, 1, pack(400, -20)) // 8 kW from the pack
       ..onFrame(0x2E5, 1, [0, 0, 0, 0, 0xD0, 0x00, 0]) // front 0
       ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x10, 0]); // rear 4 kW: 4 kW besides
@@ -677,6 +680,7 @@ void main() {
       ..onFrame(0x2B4, 1, [183, 5, 88, 14, 34, 2])
       // 400 V, -15 A: 6 kW from the pack.
       ..onFrame(0x132, 1, [0x40, 0x9C, 0x6A, 0xFF, 0, 0])
+      ..onFrame(0x2E5, 1, [0, 0, 0, 0, 0xD0, 0x00, 0])
       ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x08, 0]); // rear 2 kW: 4 kW besides
     expect(p.packKw, closeTo(6.0, 1e-9));
     expect(p.climateKw, closeTo(1.7, 1e-9));
@@ -695,11 +699,268 @@ void main() {
         .setMockMethodCallHandler(const MethodChannel('tesla_dash/net'), null));
     File('${dir.path}/trace.log').writeAsStringSync(
         [for (var i = 0; i < 400; i++) '2026-11-06T10:00:00 line $i ${'x' * 90}'].join('\n'));
-    final t = await traceTail('REPORT', bytes: 5000);
+    final f = await traceExport('REPORT');
+    final t = traceTail(f!, bytes: 5000)!;
     expect(t.length, lessThan(5100));
     expect(t, startsWith('2026-11-06T10:00:00 line ')); // not cut mid-line
     expect(t.trimRight(), endsWith('REPORT'));
     expect(t, contains('line 399')); // the newest lines are the ones kept
     expect(t, isNot(contains('line 0 ')));
+  });
+
+  test('clearing the log removes both files, behind queued writes, and keeps the build', () async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    final dir = Directory.systemTemp.createTempSync('trace');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+        const MethodChannel('tesla_dash/net'), (call) async => call.method == 'logDir' ? dir.path : null);
+    addTearDown(() => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(const MethodChannel('tesla_dash/net'), null));
+    final f = File('${dir.path}/trace.log'), old = File('${f.path}.1')..writeAsStringSync('OLD');
+    diagBuild = 'BUILD';
+    traceWrite(f, 'QUEUED\n');
+    expect(await clearTrace(), isTrue);
+    await traceWrite(f, 'NEXT\n'); // the running trace carries on
+    expect(old.existsSync(), isFalse);
+    final t = f.readAsStringSync();
+    expect(t, isNot(contains('QUEUED')));
+    expect(t, contains('cleared: build=BUILD'));
+    expect(t, endsWith('NEXT\n'));
+    expect(await clearTrace(), isTrue); // and again with less to delete
+  });
+
+  test('BT motor power from a Commander that still reads the old layout is dropped', () {
+    // From the car's trace: parked, raw 51 = 1529 (-382.5 kW) and 53 jumping.
+    final p = Panda()..fromBt({66: 1, 61: 0, 51: 1529, 53: 1028});
+    expect((p.frontKw, p.rearKw), (null, null));
+    p.fromBt({53: 1019}); // -255 kW, and the front still wrong
+    expect((p.frontKw, p.rearKw), (null, null));
+    // The front keeps it out, whatever the rear says.
+    p.fromBt({53: 258}); // 129 kW
+    expect(p.rearKw, isNull);
+    // A WiFi retry's clean-up does not lift that while Bluetooth is up.
+    p.fromBt({66: 4, 61: 20, 51: 40, 53: 40});
+    p.status = 'disconnected';
+    expect((p.frontKw, p.rearKw), (null, null));
+    // And braking reads only ON (1), not INVALID (2).
+    final q = Panda()..fromBt({66: 4, 61: 20, 65: 2});
+    expect(q.braking, isFalse);
+    q.fromBt({65: 1});
+    expect(q.braking, isTrue);
+  });
+
+  test('a trimmed id that keeps arriving gets its remove sent again', () async {
+    final p = Panda()..onFrame(0x118, 1, [0, 0, 0x20, 0, 0, 0, 0, 0]); // parked
+    p.sparseTick(); // slot 0: all off but the chime's group
+    expect((p.sparseOps, p.sparseFixes), (6, 0));
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    for (var i = 0; i < 3; i++) {
+      p.onFrame(0x3C2, 1, [0x29, 0x55, 0, 0, 0, 0, 0x31, 0]); // still coming
+    }
+    p.sparseTick(); // slot 1: its own slot, so it comes on; no repair needed
+    expect(p.sparseFixes, 0);
+    p.sparseTick(); // slot 2: off again
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    for (var i = 0; i < 3; i++) {
+      p.onFrame(0x3C2, 1, [0x29, 0x55, 0, 0, 0, 0, 0x31, 0]); // still coming
+    }
+    p.sparseTick(); // slot 3: should be off, so the remove goes out again
+    expect(p.sparseFixes, 1);
+    p.sparseTick(); // quiet since: no further repair
+    expect(p.sparseFixes, 1);
+  });
+
+  test('the wheel turns one group at a time, the car\'s parked ones in P alone', () {
+    final p = Panda()..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]); // D
+    p.sparseTick(); // a slot in, everything else is off
+    final start = p.sparseOps;
+    for (var i = 0; i < 15; i++) {
+      p.sparseTick();
+    }
+    // 15 slots on: each change is a group going on or off, and the frunk's
+    // group never comes on in gear, so at most one add and one remove a slot
+    // (and two around the cabin's slot, which shares).
+    expect(p.sparseOps - start, inInclusiveRange(20, 32));
+    expect(p.onSlots(5), 1); // charging: in any gear
+    expect(p.onSlots(0), 4); // the chime's group: every 2 s
+    expect(p.onSlots(4), 2); // the cabin: a full second
+    expect(p.maxGroupsInASlot, 2);
+  });
+
+  test('every subscribed id has one place: the stream or a polled group', () {
+    final polled = Panda.polledIds;
+    expect(polled.intersection(Panda.alwaysOn), isEmpty);
+    final missing = kSubscribeIds.toSet().difference(polled).difference(Panda.alwaysOn);
+    expect(missing, isEmpty, reason: 'new ids need a polling decision in Panda');
+    expect(Panda.alwaysOn.difference(kSubscribeIds.toSet()), isEmpty); // nothing stale
+    // Some that must and must not be polled.
+    expect(polled.containsAll([0x2E1, 0x3C2, 0x2B3]), isTrue);
+    expect(polled.intersection({0x257, 0x118, 0x101, 0x132, 0x3F5}), isEmpty);
+  });
+
+  test('a new gear shows at once, however slow the parked redraw', () {
+    var page = 0;
+    final p = Panda()
+      ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D
+      ..addListener(() => page++);
+    p.push();
+    expect(page, 1);
+    p.onFrame(0x118, 1, [0, 0, 0x20, 0, 0, 0, 0, 0]); // P, straight after
+    p.push();
+    expect((p.gear, page), ('P', 2)); // no wait for the 200 ms gap
+    p.push();
+    expect(page, 2); // nothing new: the parked rate holds
+    p.onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]); // and out of P
+    p.push();
+    expect((p.gear, page), ('D', 3));
+  });
+
+  test('charging never sticks, and the frunk leaves P with its last state', () {
+    final p = Panda()
+      ..onFrame(0x118, 1, [0, 0, 0x20, 0, 0, 0, 0, 0]) // P
+      ..charging = true;
+    for (var i = 0; i < 16; i++) {
+      p.sparseTick();
+      expect(p.groupOn(5), isTrue); // live power through the whole charge
+    }
+    p.charging = false;
+    p.onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]); // D, off the plug
+    p.sparseTick();
+    expect(p.groupOn(6), isTrue); // one slot on the way out of P
+    p.sparseTick();
+    expect(p.groupOn(6), isFalse);
+    // In gear the charging group still comes round, so a stale flag clears.
+    var seen = 0, frunk = 0;
+    for (var i = 0; i < 16; i++) {
+      p.sparseTick();
+      if (p.groupOn(5)) seen++;
+      if (p.groupOn(6)) frunk++;
+    }
+    expect((seen, frunk), (1, 0));
+  });
+
+  test('BT limits are the car\'s own, parked output is not held against it', () {
+    final p = Panda()..fromBt({66: 4, 61: 90, 51: 400, 53: 700}); // 100 and 175 kW... in D
+    expect((p.frontKw, p.rearKw), (100.0, 175.0));
+    p.fromBt({53: 1200}); // a hard launch: 300 kW rear, under its 392 kW limit
+    expect(p.rearKw, 300.0);
+    p.fromBt({66: 1, 51: 0, 53: 8}); // P, the last push still 2 kW: fine
+    expect(p.rearKw, 2.0);
+    p.fromBt({53: 16}); // 4 kW in P, a stale push: dropped, not latched
+    expect(p.rearKw, isNull);
+    p.fromBt({66: 4, 53: 80}); // and it reads again as soon as it moves off
+    expect(p.rearKw, 20.0);
+    p.fromBt({53: 419}); // hard regen, -105 kW: real, no blank readout
+    expect(p.rearKw, -105.0);
+  });
+
+  test('fields only the trace reads do not pass for car data', () {
+    final p = Panda()..fromBt({28: 36000, 29: 12});
+    expect(p.viaBt, isFalse);
+    p.fromBt({61: 30});
+    expect(p.viaBt, isTrue);
+  });
+
+  test('the trace line keeps the route\'s name out', () {
+    final p = Panda()..fromBt({6: [72, 111, 109, 101], 7: 3.2, 101: 1});
+    final t = p.traceLine();
+    expect(t, isNot(contains('72, 111')));
+    expect(t, contains('101=1'));
+  });
+
+  test('a Commander ACK mid-stream leaves the polling alone', () {
+    Uint8List ack() {
+      final b = ByteData(16)
+        ..setUint32(0, 6 << 21, Endian.little)
+        ..setUint32(4, 15 << 4, Endian.little);
+      return b.buffer.asUint8List();
+    }
+
+    final p = Panda()..onPacket(ack());
+    expect((p.acks, p.subscribes), (1, 1)); // before a stream: it wants the list
+    p.onFrame(0x257, 1, [0, 0, 0, 0, 0, 0, 0, 0]);
+    p.sparseTick();
+    final off = p.groupOn(1);
+    p.onPacket(ack());
+    expect((p.acks, p.subscribes, p.groupOn(1)), (2, 1, off)); // once streaming: no reset
+  });
+
+  test('a press wakes the groups its buttons light from, for a moment', () {
+    final p = Panda()..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]); // D
+    p.sparseTick();
+    expect((p.groupOn(5), p.groupOn(6)), (false, false));
+    p.pressed();
+    p.sparseTick();
+    expect((p.groupOn(2), p.groupOn(5)), (true, true));
+    expect(p.groupOn(3), isFalse); // not the rest
+    expect(p.groupOn(6), isFalse); // nor the frunk's burst in gear: it opens in P only
+    p.onFrame(0x118, 1, [0, 0, 0x20, 0, 0, 0, 0, 0]); // P
+    p.sparseTick();
+    expect(p.groupOn(6), isTrue);
+  });
+
+  test('0x2A7 only counts with a pack voltage: the chassis bus reuses the id', () {
+    final p = Panda()..onFrame(0x2A7, 1, [150, 137, 75, 21, 46, 188, 5, 129]); // 367 V, 1.7 kW
+    expect(p.climateKw, closeTo(1.7, 1e-9));
+    p.onFrame(0x2A7, 1, [255, 255, 255, 255, 255, 1, 0, 0]); // a road's curvature
+    expect(p.climateKw, closeTo(1.7, 1e-9));
+    // Too short for a voltage: the good frame before it vouches for nothing.
+    p.onFrame(0x2A7, 1, [150, 137, 75, 21, 46, 188, 5, 129]);
+    p.onFrame(0x2A7, 1, [255, 255, 255, 255]);
+    expect(p.climateKw, closeTo(1.7, 1e-9));
+  });
+
+  test('stopped with the pedal off, the motors read their frames, not the pack', () {
+    List<int> pack(double a) {
+      final av = (a * 10).round() & 0xFFFF;
+      return [0x40, 0x9C, av & 0xFF, av >> 8, 0, 0];
+    }
+
+    final p = Panda()
+      ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D, stopped
+      ..onFrame(0x132, 1, pack(-5)) // 2 kW
+      ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0x01, 0]); // rear 0
+    expect(p.rearKw, 0.0);
+    p.onFrame(0x132, 1, pack(-15)); // the compressor starts: 6 kW
+    expect(p.rearKw, 0.0);
+  });
+
+  test('ACKs over a silent stream bring it back, and the rate says when it is known', () async {
+    Uint8List ack() {
+      final b = ByteData(16)
+        ..setUint32(0, 6 << 21, Endian.little)
+        ..setUint32(4, 15 << 4, Endian.little);
+      return b.buffer.asUint8List();
+    }
+
+    final p = Panda()..onFrame(0x257, 1, [0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(p.speedKnown, isFalse); // the first second is not counted yet
+    p.onPacket(ack());
+    expect(p.subscribes, 0); // frames flowing: left alone
+    await Future<void>.delayed(const Duration(milliseconds: 2100));
+    p.onPacket(ack());
+    expect(p.subscribes, 1); // silent behind the ACKs: the list again
+    p.push();
+    expect((p.speedKnown, p.speedHz), (false, 0)); // a stream start counts afresh
+    p.status = 'live';
+    await Future<void>.delayed(const Duration(milliseconds: 1050));
+    p.push();
+    expect((p.speedKnown, p.speedHz), (true, 0)); // a real 0: the alarm stands
+  });
+
+  test('stopped, a late motor frame shows no regen', () {
+    final p = Panda()
+      ..onFrame(0x118, 1, [0, 0, 0x80, 0, 0, 0, 0, 0]) // D
+      ..onFrame(0x266, 1, [0, 0, 0, 0, 0x88, 0xF1, 0x0F]); // -4 kW from the braking
+    expect(p.rearKw, 0.0);
+  });
+
+  test('0x2A7 must match the pack it runs on', () {
+    final p = Panda()
+      ..onFrame(0x132, 1, [0x40, 0x9C, 0, 0, 0, 0]) // 400 V
+      ..onFrame(0x2A7, 1, [150, 137, 75, 21, 46, 188, 5, 129]); // 367 V
+    expect(p.climateKw, closeTo(1.7, 1e-9));
+    p.onFrame(0x2A7, 1, [255, 255, 255, 255, 255, 0x90, 0x03, 0]); // 228 V: no pack here
+    expect(p.climateKw, closeTo(1.7, 1e-9));
   });
 }

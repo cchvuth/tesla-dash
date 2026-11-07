@@ -12,7 +12,7 @@ plugins {
 // tells itself apart, whoever makes it.
 val buildStamp: String = run {
     fun git(vararg a: String): String = try {
-        ProcessBuilder("git", *a).directory(rootDir).redirectErrorStream(true).start()
+        ProcessBuilder("git", *a).directory(rootDir).redirectError(ProcessBuilder.Redirect.DISCARD).start()
             .inputStream.bufferedReader().readText().trim()
     } catch (e: Exception) { "" }
     val dirty = if (git("status", "--porcelain").isNotEmpty()) "+" else ""

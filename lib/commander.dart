@@ -480,14 +480,11 @@ class Commander extends ChangeNotifier {
     const gap = Duration(milliseconds: 6500);
     final wait = gap - DateTime.now().difference(_lastScan);
     if (wait > Duration.zero) await Future.delayed(wait > gap ? gap : wait); // clock set back
-    // Diagnostics may be scanning; starting ours would end it.
-    if (FlutterBluePlus.isScanningNow) throw CommanderError('bluetooth busy');
     final pin = (await SharedPreferences.getInstance()).getString('commanderId');
     var seen = <ScanResult>[];
     final hit = Completer<void>();
     final sub = FlutterBluePlus.onScanResults.listen((rs) {
-      // Other scans feed this stream too. Once approved, ours only: a
-      // neighbour's would wait for an approval that never comes, and lock
+      // Once approved, ours only: a neighbour's would wait for an approval that never comes, and lock
       // their phone out meanwhile.
       seen = [
         for (final r in rs)
@@ -503,8 +500,7 @@ class Commander extends ChangeNotifier {
           timeout: const Duration(seconds: 5),
           androidUsesFineLocation: true);
       _lastScan = DateTime.now(); // only scans that started count
-      // Ours showing up, or the scan running out. Never stopScan: it would
-      // also end a scan Diagnostics started meanwhile.
+      // Ours showing up, or the scan running out.
       await Future.any<Object?>([
         hit.future,
         FlutterBluePlus.isScanning.where((s) => !s).first,
@@ -529,7 +525,7 @@ class Commander extends ChangeNotifier {
   /// (the S3XY Dash's nav card, none of it on the bus as such) and
   /// recirculation; then what the dash shows when WiFi is off.
   static const _wifiLacks = [6, 7, 8, 9, 101];
-  static const _allFields = [..._wifiLacks, ...Panda.btFields];
+  static const _allFields = [..._wifiLacks, ...Panda.btFields, ...Panda.btTraceFields];
 
   /// How much car data a session subscribes to: none (the buttons only),
   /// what WiFi lacks, or all of it. A subscription only adds, so a session

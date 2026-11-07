@@ -227,7 +227,9 @@ class _Nav extends StatelessWidget {
           ),
           child: child,
         );
-    if (oneLine) return card(line);
+    // Nothing to put on the line yet (the route's fields come round slowly).
+    final blank = !trip && dist == null && energy == null && (oneLine || length == null);
+    if (oneLine) return blank ? const SizedBox.shrink() : card(line);
     return card(Column(mainAxisSize: MainAxisSize.min, children: [
       // Its name, top centre, with the place beside it once Bluetooth has
       // one: two lines at most, so the bar grows no taller.
@@ -246,7 +248,7 @@ class _Nav extends StatelessWidget {
           ),
         ],
       ]),
-      line,
+      if (!blank) line,
     ]));
   }
 }
@@ -411,7 +413,7 @@ class _Controls extends StatelessWidget {
             // Live, the speed frames a second: the screen redraws up to 45 a
             // second, so under ~36 the dash waits on the Commander (the car
             // sends about 50).
-            stat: obd.link == WifiLink.live ? '${obd.speedHz}' : null,
+            stat: obd.link == WifiLink.live && obd.speedKnown ? '${obd.speedHz}' : null,
             statColor: obd.speedHz >= 36 ? Colors.white : obd.speedHz >= 18 ? kWarn : kAlert,
             tip: obd.link == WifiLink.live
                 ? 'WiFi: live, ${obd.speedHz} speed frames/s (the car sends about 50), ${obd.frameHz} frames/s in all'
@@ -847,8 +849,8 @@ class _GBall extends StatefulWidget {
 }
 
 class _GBallState extends State<_GBall> {
-  // The last few dots, oldest first: about a third of a second at the
-  // link's 30 pushes a second. Still, they gather under the dot.
+  // The last few dots, oldest first: about a fifth of a second at the
+  // fast tick's 45 a second. Still, they gather under the dot.
   final _trail = <Offset>[];
 
   @override

@@ -7,6 +7,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -116,17 +117,29 @@ class MainActivity : FlutterActivity() {
                     "logDir" -> result.success(getExternalFilesDir(null)?.path)
                     // versionName with the build's stamp (see build.gradle.kts).
                     "buildInfo" -> result.success(packageManager.getPackageInfo(packageName, 0).versionName)
-                    // The share sheet for one file in that folder (the trace log).
+                    // The share sheet for the trace log, and the one rolled
+                    // out of it if there is one: a drive can span the two.
                     "shareLog" -> {
                         val f = File(call.argument<String>("path") ?: "")
                         if (!f.isFile) return@setMethodCallHandler result.success(false)
-                        val uri = FileProvider.getUriForFile(this, "$packageName.logs", f)
+                        val uris = ArrayList(
+                            listOf(File(f.path + ".1"), f).filter { it.isFile }
+                                .map { FileProvider.getUriForFile(this, "$packageName.logs", it) }
+                        )
                         startActivity(
                             Intent.createChooser(
-                                Intent(Intent.ACTION_SEND)
-                                    .setType("text/plain")
-                                    .putExtra(Intent.EXTRA_STREAM, uri)
-                                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                                (if (uris.size > 1) {
+                                    Intent(Intent.ACTION_SEND_MULTIPLE)
+                                        .putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                                } else {
+                                    Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_STREAM, uris[0])
+                                }).setType("text/plain").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    // So the chooser itself may read them too.
+                                    .also { share ->
+                                        share.clipData = ClipData.newRawUri(null, uris[0]).apply {
+                                            uris.drop(1).forEach { addItem(ClipData.Item(it)) }
+                                        }
+                                    },
                                 "Share the trace log",
                             )
                         )

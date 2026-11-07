@@ -115,7 +115,8 @@ the scroll-wheel approval only the first time, or when you tap.
    settings** when asked: it keeps the split screen in landscape.
 
 Diagnostics (the WiFi icon › Diagnostics) lists every CAN id seen, the decoded values
-and the Bluetooth state, and **Copy log** puts it all on the clipboard.
+and the Bluetooth state. Its top bar shares the trace log, copies its end to the
+clipboard, or clears it.
 
 ## Build
 
@@ -147,7 +148,6 @@ sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
 | `lib/glyphs.dart` | the car's icons, as vector paths |
 | `lib/car_panel.dart` | the ⋯ actions |
 | `lib/diag.dart` | Diagnostics |
-| `lib/finder.dart` | finds which CAN frames carry the tyre pressures and the route |
 
 [docs/signals-and-actions.md](docs/signals-and-actions.md) maps every value
 and action the dash does not have yet to its CAN signal or Commander

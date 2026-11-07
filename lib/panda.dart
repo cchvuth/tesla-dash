@@ -14,8 +14,8 @@ import 'signals.dart';
 /// support. The Commander then raises the `S3XY_OBD` access point, password
 /// `12345678`, and streams CAN over UDP on 192.168.4.1:1338.
 ///
-/// Fields are mutated in place and listeners notified at ~30 Hz — CAN arrives
-/// far faster than the screen can draw.
+/// Fields are mutated in place and listeners notified at a capped rate (see
+/// [Panda.pushMs]): CAN arrives far faster than the screen can draw.
 /// What the WiFi link is doing, for its icon (see [Panda.link]).
 enum WifiLink {
   idle, // not started
@@ -44,37 +44,42 @@ class Panda extends ChangeNotifier {
   /// between the pack and the motors (battery heating, pumps...). WiFi only.
   double? lvKw;
   double? _compKw, _heatLKw, _heatRKw, _lvV;
+  bool _compOk = false;
   double? get climateKw => _compKw == null && _heatLKw == null && _heatRKw == null
       ? null
       : (_compKw ?? 0) + (_heatLKw ?? 0) + (_heatRKw ?? 0);
-  /// The rest of what the pack feeds (battery heating, pumps...): averaged
-  /// slowly, as the motor frames it comes from run behind the pack.
+  /// The rest of what the pack feeds (battery heating, pumps...), averaged
+  /// slowly over the motor frames.
   double? get otherKw => _other;
   double? _packV, _frontAt, _rearAt, _other;
 
-  /// The motor frames come about once a second and run about a second behind
-  /// the pack's (~100 a second): on a drive's trace they matched the pack a
-  /// second earlier best (median 1.3 kW off, against 2.2 kW now). So the
-  /// motors shown are the pack now less what else it feeds (measured climate
-  /// and 12 V, and the averaged rest), shared front and rear as in the last
-  /// motor frame. A motor frame only resets that share and nudges the rest:
-  /// putting its value up would pull the readout a second back.
+  /// The motor frames come about once a second, the pack's about 90 times.
+  /// So the motors shown are the pack now less what else it feeds (measured
+  /// climate and 12 V, and the averaged rest), shared front and rear as in
+  /// the last motor frame. A motor frame only resets that share and nudges
+  /// the rest: putting its value up would make the readout step once a second.
   void _motorFrame() {
     final p = packKw;
-    if (p == null || _rearAt == null) return; // the rear reports first on this car
+    if (p == null || _rearAt == null || _frontAt == null) return; // a whole reading
     final rest = (p - (_frontAt ?? 0) - (_rearAt ?? 0) - (climateKw ?? 0) - (lvKw ?? 0)).clamp(0, 5).toDouble();
     final o = _other;
     _other = o == null ? rest : o + (rest - o) * 0.05; // about 20 frames' worth
   }
 
-  /// The exact motor values in P, or before the pack has been heard.
-  bool get _exact => packKw == null || _other == null || _gear == 'P';
+  bool get _stopped => speed == 0 && (pedalPct ?? 0) == 0;
+
+  /// The exact motor values in P, at a standstill (the climate's held
+  /// reading would otherwise show its changes as drive or regen), or before
+  /// the pack has been heard.
+  bool get _exact => packKw == null || _other == null || _gear == 'P' || _stopped;
 
   void _blend() {
     final p = packKw, other = _other, f = _frontAt, r = _rearAt;
     if (_exact || p == null || other == null || r == null) {
-      frontKw = f;
-      rearKw = r;
+      // Stopped there is no regen: the frame can be a second old, from the
+      // last of the braking.
+      frontKw = _stopped && f != null ? max(0.0, f) : f;
+      rearKw = _stopped && r != null ? max(0.0, r) : r;
       return;
     }
     final motors = p - (climateKw ?? 0) - (lvKw ?? 0) - other;
@@ -262,6 +267,11 @@ class Panda extends ChangeNotifier {
       65, 66, 80, 81, 82, 85, 105, 106, 107, 108, 110, 111, 112, 113, 114, 115, 116,
       117, 118];
 
+  /// Subscribed too, for the trace alone: the pack's and the 12 V side's volts
+  /// and amps, to see whether they could stand in for motor power over
+  /// Bluetooth. Nothing reads them, so they say nothing of [viaBt].
+  static const btTraceFields = [28, 29, 77, 78];
+
   /// A Commander push, or null when its link dropped. WiFi comes first: the
   /// values are kept, and applied only while no frames come over WiFi.
   void fromBt(Map<int, Object>? d) {
@@ -296,7 +306,9 @@ class Panda extends ChangeNotifier {
     if (at(61) case final v? when v < 511) speed = v.toDouble();
     if (at(62) case final v? when v != 255) pedalPct = (v * 0.4).clamp(0, 100).toDouble();
     if (at(66) case final v?) gear = kGears[v] ?? '—';
-    if (at(65) case final v?) braking = v != 0 && const {'R', 'N', 'D'}.contains(_gear);
+    // 1 is ON; 2 INVALID (all that 0x118's old brake bits read since 2026.38,
+    // which the Commander may still pass on) is not braking.
+    if (at(65) case final v?) braking = v == 1 && const {'R', 'N', 'D'}.contains(_gear);
     // TurnSignalStatus: 1 signalling with the lamp dark, 2 lamp lit.
     final l = at(63) ?? 0, r = at(64) ?? 0;
     indL = l != 0;
@@ -304,8 +316,7 @@ class Panda extends ChangeNotifier {
     _flasher((l == 2 ? 1 : 0) | (r == 2 ? 2 : 0));
     if (at(106) case final v?) blindL = v == 1 || v == 2;
     if (at(107) case final v?) blindR = v == 1 || v == 2;
-    if (kw(51) case final v?) frontKw = v;
-    if (kw(53) case final v?) rearKw = v;
+    _btMotors(kw(51), kw(53));
     if (at(111) case final v?) socPct = v.clamp(0, 100).toDouble();
     if (at(112) case final v?) rangeMi = v.toDouble(); // miles, always
     if (at(110) case final v?) speedLimit = v == 0 || v >= 155 ? null : v.toDouble();
@@ -344,9 +355,9 @@ class Panda extends ChangeNotifier {
           _ => '${id.toRadixString(16)}[none]',
         };
     final b = _bt;
-    return 'wifi "$status" ${frameHz}Hz speed ${speedHz}Hz foreign ${foreignHz}Hz resubs $resubscribes live=$wifiLive viaBt=$viaBt gear=$gear speed=$speed '
+    return 'wifi "$status" ${frameHz}Hz speed ${speedHz}Hz gap ${speedGapMs}ms foreign ${foreignHz}Hz resubs $resubscribes subs $subscribes acks $acks sparse ${_sparseWanted ? '' : 'off '}$sparseOps/$sparseFixes live=$wifiLive viaBt=$viaBt gear=$gear speed=$speed '
         'front=$frontKw rear=$rearKw pack=${packKw?.toStringAsFixed(1)} climate=${climateKw?.toStringAsFixed(2)} 12v=${lvKw?.toStringAsFixed(2)} other=${otherKw?.toStringAsFixed(2)} regenMax=$regenMaxKw | ${raw(0x2E5)} | ${raw(0x266)} | ${raw(0x252)} | '
-        'bt 51=${b?[51]} 53=${b?[53]} 32=${b?[32]} fields=${b?.length} | '
+        'bt ${b == null ? '-' : (b.keys.where((k) => b[k] is num).toList()..sort()).map((k) => '$k=${b[k]}').join(' ')} | '
         'now 118 ${hexOf(frames[0x118]?.data ?? const [])} 2b6 ${hexOf(frames[0x2B6]?.data ?? const [])} '
         'brake=$braking slippery=$slippery';
   }
@@ -365,6 +376,35 @@ class Panda extends ChangeNotifier {
       b.write(' ${e.key}=${v == null ? '-' : num(v)}');
     }
     return '$b';
+  }
+
+  DateTime? _btMotorBadAt;
+
+  /// The Commander's own motor power (fields 51, 53) is its decode of 0x2E5
+  /// and 0x266, which 2026.38 repacked (power 0|11 -> 41|11). Until its
+  /// firmware follows, a parked car reads -382.5 kW front and a jumping rear
+  /// (the same garbage WiFi showed before the dash moved to bit 41). Values
+  /// past what the motors can do (the car's own limits: 208 kW front, 392
+  /// rear) mark the readout bad for 30 s: no number rather than a wrong one.
+  /// Regen stops at the pack's limit (92 kW seen) with room to spare; the
+  /// garbage seen sits well past it. Right values pass. Parked, a reading of
+  /// real output is dropped but not
+  /// held against it: pushes come on a change, so the last one can be the
+  /// drive's.
+  void _btMotors(double? f, double? r) {
+    if (f == null && r == null) return;
+    bool off(double? v, double max) => v != null && (v < -200 || v > max);
+    bool moving(double? v) => v != null && v.abs() > 3;
+    final now = DateTime.now();
+    if (off(f, 210) || off(r, 400)) _btMotorBadAt = now;
+    final at = _btMotorBadAt;
+    if ((at != null && now.difference(at) < const Duration(seconds: 30)) ||
+        (_gear == 'P' && (moving(f) || moving(r)))) {
+      frontKw = rearKw = null;
+      return;
+    }
+    if (f != null) frontKw = f;
+    if (r != null) rearKw = r;
   }
 
   double? get range =>
@@ -434,6 +474,17 @@ class Panda extends ChangeNotifier {
   int speedHz = 0;
   int _speedFrames = 0;
 
+  /// A full second of this stream has been counted: until then [speedHz]
+  /// says nothing, and its 0 is no alarm. After, a 0 is a real stall.
+  bool speedKnown = false;
+
+  /// The longest wait between two speed frames in the last second, ms: a
+  /// healthy rate can still hide a stall, and it is the stall that reads as
+  /// lag. Frames in one packet count as one arrival.
+  int speedGapMs = 0;
+  int _speedGap = 0;
+  DateTime? _speedAt;
+
   /// Frames a second for ids the dash never asked for, and how often the
   /// filter was sent again because of them (both in the trace).
   int foreignHz = 0, _foreign = 0, resubscribes = 0;
@@ -457,6 +508,7 @@ class Panda extends ChangeNotifier {
   /// When set, ask the Commander for every id instead of just [kSubscribeIds].
   /// Costs latency on the dash — diagnostics only.
   bool _all = false;
+  bool get captureAll => _all;
   set captureAll(bool v) {
     if (_all == v) return;
     _all = v;
@@ -637,6 +689,9 @@ class Panda extends ChangeNotifier {
     }
     _sock!.listen(_onEvent);
     _lastRecv = null;
+    _streaming = false;
+    _ackSubAt = DateTime.fromMillisecondsSinceEpoch(0); // the last socket's
+    _beatAt = DateTime.now();
     _connectedAt = DateTime.now();
     _set(WifiLink.hello, 'saying hello to ${c.host}:${c.port}…', _connectedAt!.add(const Duration(seconds: 8)));
     _hello();
@@ -713,11 +768,14 @@ class Panda extends ChangeNotifier {
   /// brake or blind-spot glow, pill, warning or lit button.
   void _forget() {
     gear = '—';
-    frameHz = speedHz = 0;
+    frameHz = speedHz = speedGapMs = _speedGap = 0;
+    speedKnown = false;
+    _speedAt = null; // an outage is no gap in the stream
     braking = indL = indR = blindL = blindR = false;
     // With Bluetooth carrying the lamps on, the flasher keeps its beat: a
     // reset here would read their next push as a fresh flash.
     if (_bt == null) {
+      _btMotorBadAt = null; // else a WiFi retry would lift it every few seconds
       _blinkOff?.cancel();
       blinkLit = _litL = false;
       _wasLit = 0;
@@ -750,6 +808,7 @@ class Panda extends ChangeNotifier {
     speed = 0;
     frontKw = rearKw = pedalPct = packKw = _packV = _frontAt = _rearAt = _other = null;
     lvKw = _compKw = _heatLKw = _heatRKw = _lvV = null;
+    _compOk = false;
   }
 
   void _send(List<int> bytes) {
@@ -770,13 +829,11 @@ class Panda extends ChangeNotifier {
     // Clear first (0x18): 0x0f only adds, so a "send all" left on (by
     // Diagnostics, or any other client) kept every id coming: 353 ids at
     // 2100 frames/s on 2026.38.6, a third of them dropped, the rest late.
+    subscribes++;
     _send(const [0x18]);
     // The full list below holds them all; the schedule trims them again.
     _sparseOn.clear();
-    for (final t in _sparseTimers.values) {
-      t.cancel();
-    }
-    _sparseTimers.clear();
+    _sparseStray.clear();
     var packet = <int>[0x0f];
     for (final id in kSubscribeIds) {
       if (packet.length > 1 + 3 * 42) {
@@ -788,47 +845,171 @@ class Panda extends ChangeNotifier {
     if (packet.length > 1) _send(packet);
   }
 
-  /// Ids whose data changes slowly, polled in a short window every N seconds
-  /// rather than streamed: seat belts and their buckles every 2 s, the frunk
-  /// and charge port every 5 s, and those two only while parked (neither can
-  /// change in gear, and their 64 frames/s were the biggest burst). Added with
-  /// 0x0f, removed with 0x0e (the wiki's pair). The values keep their last
-  /// reading between polls. A drive showed the cost of a burst: speed frames
-  /// fell about a quarter of the burst's size in the second it came, so the
-  /// window is 0.4 s, not a second.
-  static const _sparse = <int, List<int>>{
-    2: [0x3C2, 0x3A1, 0x31A], // belts and their buckles, battery heating
-    5: [0x2E1, 0x25D], // frunk, charge port: parked only
+  /// How the ids the dash subscribes to are polled. Every one is in exactly
+  /// one place (a test holds this): [alwaysOn], or a group of [_sparse].
+  ///
+  /// The Commander can only filter by id, so thinning means switching an id
+  /// on for a moment now and then (0x0f adds, 0x0e removes: the wiki's pair);
+  /// the values keep their last reading between. A burst costs speed frames
+  /// in the second it arrives (a drive: about a quarter of its size), so
+  /// [_wheel] turns one group at a time through half-second slots: the load
+  /// stays small and even rather than spiking. An id must send at least once
+  /// a slot to be caught, so under about 3 frames a second it stays on. Every
+  /// group is on after a subscribe, until the next slot, so a new stream
+  /// reads everything once ([_wheelOn]). Rates are from a drive's report.
+  ///
+  /// On the stream, every frame: what moves what the driver sees (speed,
+  /// pedal and gear, yaw, the pack's power for the ring), the lamps, the
+  /// grip and cruise state, driver-assist warnings; the ids the car itself
+  /// sends slowly (energy, nav route and energy, tyre pressures, cells,
+  /// outside, follow gap, charging limit, time and reason, motor power, soc
+  /// and range, climate switches, mirror tilt); and nav time, as only one
+  /// page of its frame holds it and nothing else gives it on this car. Two are never on this car's stream (tyre
+  /// pressure 0x219, recirculation 0x243): the Commander stands in for them.
+  static const alwaysOn = <int>{
+    0x257, 0x118, 0x101, 0x132, // speed, gear/pedal/brake, yaw, pack V and A
+    0x3F5, 0x2B6, 0x286, 0x399, 0x3F6, 0x3F8, // lamps, grip, cruise, assist
+    0x2E5, 0x266, 0x33A, 0x332, 0x352, 0x392, // motor power, soc, cells, energy
+    0x347, 0x238, 0x3FD, 0x321, 0x2F3, 0x25A, 0x273, // nav, outside, climate, tyres, tilt
+    0x472, 0x333, 0x33B, // charging: reason, limit, time
+    0x219, 0x243, // not on this car's stream
   };
-  static const _parkedOnly = {5};
-  static const _pollWindow = Duration(milliseconds: 400);
-  final _sparseOn = <int, bool>{}; // per period: its ids are subscribed now
-  final _sparseTimers = <int, Timer>{};
-  int _sparseT = 0;
 
+  /// Polled, in frames a second as streamed. Their slots are in [_wheel].
+  static const _sparse = <({bool parked, List<int> ids})>[
+    (parked: false, ids: [0x3A1]), // belts' chime, battery heating: 17
+    (parked: false, ids: [0x3C2, 0x31A]), // buckles: 22
+    (parked: false, ids: [0x102, 0x103, 0x3E2]), // doors, trunk, map lights: 22
+    (parked: false, ids: [0x252, 0x2A7, 0x2B4]), // regen limit, draws: 26
+    (parked: false, ids: [0x2B3]), // cabin temperatures, CO2, heater: 14
+    // In any gear, or a charge ended just before driving off would read as
+    // charging all the way; and on throughout a charge, for its live power.
+    (parked: false, ids: [0x25D, 0x212]), // charge port, charging: 16
+    // In P alone, as a burst this size costs the most, plus one slot on the
+    // way out of P to leave with its last state. A frunk that opens on the
+    // move does not show until P: the car's own screen says so.
+    (parked: true, ids: [0x2E1]), // frunk: 53
+  ];
+  static const _chargeGroup = 5;
+  static const _chipGroups = {2, 5, 6}; // what the buttons light from
+
+  /// The groups on in each half-second slot, an 8 s round: seat belts, doors
+  /// and lights every 2 s, the slow readouts every 4 s, charging and the frunk
+  /// every 8 s. The cabin's frame turns through 17 pages in about a
+  /// second, so it gets a full second every 8 s: a short window at a steady
+  /// spacing would stay on the same pages, and in a simulation never saw
+  /// CO2's. Its second slot shares with the lightest group.
+  static const _wheel = <List<int>>[
+    [0], [1], [2], [3],
+    [0], [1], [2], [4],
+    [0, 4], [1], [2], [3],
+    [0], [1], [2], [5, 6],
+  ];
+  final _sparseOn = <int, bool>{}; // per group: its ids are subscribed now
+  final _sparseOffAt = <int, DateTime>{}; // when each group's remove went out
+  final _sparseStray = <int, int>{}; // frames of a group that should be off
+  static final _sparseOf = {
+    for (var i = 0; i < _sparse.length; i++)
+      for (final id in _sparse[i].ids) id: i,
+  };
+  int _slot = 0;
+  bool _wasParked = false;
+  bool _streaming = false; // CAN frames have come on this socket
+  DateTime _streamAt = DateTime.fromMillisecondsSinceEpoch(0); // the first of them
+
+  /// The wheel turns while the stream runs. Not in a stall: everything stays
+  /// on for the stream's return, to read what went blank meanwhile. Nor in
+  /// its first 2 s, which read everything once: else a tick just after the
+  /// first frame trims what has not come yet, and a car on charge shows no
+  /// charge for up to a round.
+  bool get _wheelOn {
+    final now = DateTime.now();
+    return _streaming && now.difference(_canAt).inSeconds < 3 && now.difference(_streamAt).inSeconds >= 2;
+  }
+
+  /// The last frame of the stream proper. Not an ACK, nor a polled id: the
+  /// wheel keeps those coming from a filter that has lost everything else,
+  /// which would pass for a live link with speed and gear frozen.
+  DateTime _canAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _ackSubAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// The last keep-alive tick. A long gap means the app was frozen: the
+  /// Commander has dropped the session and what waits in the socket is old.
+  DateTime _beatAt = DateTime.now();
+  DateTime _hotUntil = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// A button was pressed: its chip should answer in a moment, not at the
+  /// group's next slot. A press seen as doing nothing gets pressed twice.
+  void pressed() => _hotUntil = DateTime.now().add(const Duration(seconds: 3));
+
+  /// For the trace: full subscribes sent, the Commander's own ACK frames
+  /// (they trigger one), sparse add/remove commands, and removes sent again
+  /// because a trimmed id kept arriving. A drive where the trimming did not
+  /// hold (a run at full rate for 20 minutes) did not say which of these it was.
+  int subscribes = 0, acks = 0, sparseOps = 0, sparseFixes = 0;
+
+  static Set<int> get polledIds => {for (final g in _sparse) ...g.ids};
+
+  /// Polling on (the dialog's switch). Off, every id streams all the time:
+  /// live doors and belts, and about 540 frames a second instead of 370. Takes
+  /// effect at the next tick.
+  bool get sparse => _sparseWanted;
+  set sparse(bool v) {
+    if (v == _sparseWanted) return;
+    _sparseWanted = v;
+    if (!v) _sparseAll = true;
+  }
+
+  bool _sparseWanted = true, _sparseAll = false;
+
+  @visibleForTesting
+  void sparseTick() => _sparseTick();
+
+  @visibleForTesting
+  bool groupOn(int group) => _sparseOn[group] ?? true;
+
+  /// Slots of the round a group is on in.
+  @visibleForTesting
+  int onSlots(int group) => _wheel.where((s) => s.contains(group)).length;
+
+  @visibleForTesting
+  int get maxGroupsInASlot => _wheel.map((s) => s.length).reduce(max);
+
+  /// The next slot: each group on or off as the wheel says, whatever it was.
   void _sparseTick() {
     if (_all) return;
-    _sparseT++;
-    for (final MapEntry(key: n, value: ids) in _sparse.entries) {
-      final on = _sparseOn[n] ?? true;
-      final due = _sparseT % n == 0 && (!_parkedOnly.contains(n) || _gear == 'P');
-      if (due) {
-        if (!on) {
-          _sparseOn[n] = true;
-          _sendIds(0x0f, ids);
-        }
-        // Off again after the window.
-        _sparseTimers[n]?.cancel();
-        _sparseTimers[n] = Timer(_pollWindow, () {
-          if (_sparseOn[n] ?? true) {
-            _sparseOn[n] = false;
-            _sendIds(0x0e, ids);
-          }
-        });
-      } else if (on && !(_sparseTimers[n]?.isActive ?? false)) {
-        _sparseOn[n] = false; // after a full subscribe, or the car left P
-        _sendIds(0x0e, ids);
+    if (!_sparseWanted) {
+      // Everything on, and said again each round: this is UDP, and with the
+      // wheel stopped a lost add would leave a group dark for the drive.
+      if (_sparseAll || _slot++ % _wheel.length == 0) {
+        _sparseAll = false;
+        _sparseOn.clear();
+        sparseOps++;
+        _sendIds(0x0f, polledIds.toList());
       }
+      return;
+    }
+    final slot = _wheel[_slot++ % _wheel.length];
+    final parked = _gear == 'P', left = _wasParked && !parked;
+    final hot = DateTime.now().isBefore(_hotUntil);
+    _wasParked = parked;
+    for (var i = 0; i < _sparse.length; i++) {
+      final g = _sparse[i], due = slot.contains(i);
+      final want = (hot && _chipGroups.contains(i) && (!g.parked || parked)) ||
+          (g.parked ? (due && parked) || left : due || (i == _chargeGroup && charging));
+      // A group that should be off, whose frames still come: the remove was
+      // lost or ignored, so send it again.
+      if (!want && (_sparseStray[i] ?? 0) >= 3) {
+        sparseFixes++;
+        _sparseOffAt[i] = DateTime.now();
+        _sendIds(0x0e, g.ids);
+      }
+      _sparseStray[i] = 0;
+      if (want == (_sparseOn[i] ?? true)) continue;
+      _sparseOn[i] = want;
+      if (!want) _sparseOffAt[i] = DateTime.now();
+      sparseOps++;
+      _sendIds(want ? 0x0f : 0x0e, g.ids);
     }
   }
 
@@ -841,15 +1022,28 @@ class Panda extends ChangeNotifier {
     // after the app was frozen the Commander has dropped the session, and a
     // hello now would start a new stream without the step aside (see
     // [beforeStream]); the retry goes through it.
-    final since = DateTime.now().difference(_lastRecv ?? _connectedAt!);
+    final frozen = DateTime.now().difference(_beatAt).inSeconds >= 8;
+    _beatAt = DateTime.now();
+    if (frozen) {
+      _attemptConnect(); // through the step aside, as a new stream must
+      return;
+    }
+    final base = _streaming ? _canAt : _connectedAt!;
+    final since = DateTime.now().difference(base);
     if (since.inSeconds >= 8) {
       _scheduleRetry(_lastRecv == null ? 'Commander not answering' : 'link lost');
       return;
     }
-    _sparseTick();
+    if (_wheelOn) {
+      _sparseTick();
+      // A slot is half a second. Looked at again: the link may be gone by then.
+      Timer(const Duration(milliseconds: 500), () {
+        if (_wheelOn) _sparseTick();
+      });
+    }
     _hello();
     if (since.inSeconds >= 3 && _lastRecv != null) {
-      _set(WifiLink.quiet, 'link quiet — resubscribing', _lastRecv!.add(const Duration(seconds: 8)));
+      _set(WifiLink.quiet, 'link quiet — resubscribing', base.add(const Duration(seconds: 8)));
       _subscribe();
     }
   }
@@ -858,16 +1052,27 @@ class Panda extends ChangeNotifier {
     if (e != RawSocketEvent.read) return;
     final dg = _sock?.receive();
     if (dg == null) return;
-    // Frames back while a retry for a stalled link is pending: keep this
-    // link (and its keep-alive) instead of tearing it down.
-    if (_keepAlive == null && _cfg != null) {
-      _retry?.cancel();
-      _keepAlive = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
+    if (_keepAlive != null && DateTime.now().difference(_beatAt).inSeconds >= 8) {
+      _beatAt = DateTime.now();
+      _attemptConnect(); // frozen: see [_tick]
+      return;
     }
     _lastRecv = _lastFrame = DateTime.now();
-    _attempt = 0;
+    final was = _canAt;
     _onPacket(dg.data);
-    _push();
+    // The stream eases the backoff, not an ACK: a sleeping car's Commander
+    // answers hellos, and each retry takes Bluetooth off it.
+    if (_canAt != was) _attempt = 0;
+    // The stream back while a retry for a stalled link is pending: keep this
+    // link (and its keep-alive) instead of tearing it down. The stream, not
+    // any packet: an ACK or a polled id would cancel the retry for nothing.
+    if (_canAt != was && _keepAlive == null && _cfg != null) {
+      _retry?.cancel();
+      _beatAt = DateTime.now();
+      _keepAlive = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
+    }
+    // An ACK alone answers a hello; after that only the stream says live.
+    if (_canAt != was || _link == WifiLink.hello) _push();
   }
 
   /// A packet is a run of 16-byte records: two little-endian uint32 of header
@@ -883,7 +1088,19 @@ class Panda extends ChangeNotifier {
       final bus = w1 >> 4;
       if (id == 0) continue;
       if (bus == 15 && id == 6) {
-        _subscribe(); // Commander ACK — it wants the id list again
+        acks++;
+        // The Commander's ACK: it wants the id list. Not while frames flow:
+        // the list sent again would undo the polling. But an ACK refreshes
+        // the link's clock, so a stream gone silent behind ACKs would never
+        // read as quiet in [_tick]: they are what brings it back.
+        // At most every 2 s: a Commander that ACKs commands would otherwise
+        // answer each subscribe with another.
+        final now = DateTime.now();
+        if ((!_streaming || now.difference(_canAt).inSeconds >= 2) &&
+            now.difference(_ackSubAt).inSeconds >= 2) {
+          _ackSubAt = now;
+          _subscribe();
+        }
         continue;
       }
       if (len < 1 || len > 8) continue;
@@ -915,8 +1132,26 @@ class Panda extends ChangeNotifier {
   }();
 
   void _onFrame(int id, int bus, List<int> data) {
+    if (!_streaming || !_sparseOf.containsKey(id)) _canAt = DateTime.now();
+    if (!_streaming) {
+      // A stream's first frame: its first second counts from here.
+      _streaming = true;
+      _streamAt = _canAt;
+      _startCount(_canAt);
+    }
     _frameCount++;
-    if (id == 0x257) _speedFrames++;
+    if (_sparseOf[id] case final n?) {
+      final off = _sparseOffAt[n];
+      if (_sparseOn[n] == false && off != null && DateTime.now().difference(off).inMilliseconds > 300) {
+        _sparseStray[n] = (_sparseStray[n] ?? 0) + 1;
+      }
+    }
+    if (id == 0x257) {
+      _speedFrames++;
+      final now = DateTime.now(), at = _speedAt;
+      if (at != null) _speedGap = max(_speedGap, now.difference(at).inMilliseconds);
+      _speedAt = now;
+    }
     final f = frames.putIfAbsent(id, () => Frame(bus));
     f.count++;
     f.lastBus = bus;
@@ -934,8 +1169,8 @@ class Panda extends ChangeNotifier {
         case 'pedal':
           pedalPct = v.clamp(0, 100);
         case 'brake':
-          // Foot on the pedal while the car can move. 'gear' comes before
-          // 'brake' in kSignals, so an auto-park's P clears it in the frame
+          // The car's regen-brake lamp (see kSignals) while it can move.
+          // 'gear' comes before 'brake', so an auto-park's P clears it in the frame
           // that brings it. ponytail: no age-out; add one in _tick should
           // 0x118 ever stop while in R/N/D.
           braking = v == 1 && const {'R', 'N', 'D'}.contains(_gear);
@@ -1076,8 +1311,12 @@ class Panda extends ChangeNotifier {
           _rearAt = v;
           _motorFrame();
           _blend();
+        case 'compV':
+          _compOk = v >= 200 && v <= 600 && (v - (_packV ?? v)).abs() < 40;
         case 'compW':
-          _compKw = v / 1000;
+          // A shorter frame has no voltage, so no say in _compOk: the last
+          // frame's would pass the chassis bus's curvature off as power.
+          if (_compOk && data.length >= 7) _compKw = v / 1000;
         case 'heatL':
           _heatLKw = v / 1000;
         case 'heatR':
@@ -1214,26 +1453,66 @@ class Panda extends ChangeNotifier {
     }
   }
 
-  // ~30 Hz repaint. Notifying per frame would just drop frames elsewhere.
-  /// The shortest gap between two redraws, ms: 22 is about 45 a second (was
-  /// 33, 30 a second). A replayed drive cost ~3% of a core more at 60.
+  // Notifying per frame would just drop frames elsewhere.
+  /// The shortest gap between two redraws of what moves, ms: 22 is about 45
+  /// a second (was 33, 30 a second). A replayed drive cost ~3% of a core more
+  /// at 60. Parked nothing moves, so [pageMs] there too.
   static const pushMs = 22;
+
+  /// The shortest gap between two redraws of the whole dash while frames
+  /// come: the cards change every few seconds at most. Any other change
+  /// (a link's state, a lamp's flash) notifies at once.
+  static const pageMs = 200;
+
+  /// Ticks at the redraw rate, for what moves with the car: speed, the ring,
+  /// the pedal line, the g-ball, the edge glows. The rest listen to the Panda
+  /// itself, as they change every few seconds at most: in a replay on the
+  /// emulator this took about a quarter off the main thread (6.3% to 4.8%),
+  /// and slowing the fast tick in P about a third off the whole app.
+  Listenable get fast => _fast;
+  final _fast = _Tick();
+  DateTime _lastPage = DateTime.fromMillisecondsSinceEpoch(0);
+  String? _shownGear;
+
+  @visibleForTesting
+  void fastTick() => _fast.fire();
+
+  @visibleForTesting
+  void push() => _push();
+
+  void _startCount(DateTime now) {
+    _lastHz = now;
+    _frameCount = _speedFrames = _foreign = 0;
+    speedKnown = false;
+  }
 
   void _push() {
     final now = DateTime.now();
+    if (status != 'live') _startCount(now); // back from a stall: likewise
     if (now.difference(_lastHz).inSeconds >= 1) {
       frameHz = _frameCount;
       speedHz = _speedFrames;
+      speedKnown = true;
+      speedGapMs = _speedGap;
+      _speedGap = 0;
       foreignHz = _foreign;
       _floodCheck(now);
       _frameCount = _speedFrames = _foreign = 0;
       _lastHz = now;
     }
-    if (now.difference(_lastPush).inMilliseconds < pushMs) return;
+    // A new gear shows at once, whatever the rate: into P as out of it.
+    final shifted = _gear != _shownGear;
+    if (!shifted && now.difference(_lastPush).inMilliseconds < (_gear == 'P' ? pageMs : pushMs)) return;
     _lastPush = now;
+    _shownGear = _gear;
+    final back = shifted || status != 'live'; // the links act on this at once
     status = 'live';
     until = null;
-    notifyListeners();
+    _fast.fire();
+    if (back || now.difference(_lastPage).inMilliseconds >= pageMs) {
+      _lastPage = now;
+      notifyListeners();
+    }
   }
 
   /// Puts the link in a state, for tests and screenshots.
@@ -1253,8 +1532,14 @@ class Panda extends ChangeNotifier {
   @override
   void dispose() {
     disconnect();
+    _fast.dispose();
     super.dispose();
   }
+}
+
+/// A plain tick to listen to.
+class _Tick extends ChangeNotifier {
+  void fire() => notifyListeners();
 }
 
 class Frame {

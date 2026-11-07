@@ -45,8 +45,8 @@ class RingGauge extends StatefulWidget {
   final Widget child;
 
   /// Glide on every change. Off, a change under [_jumpKw] lands at once and
-  /// only a jump glides: the screen then redraws as the data comes (30 a
-  /// second) instead of at its full rate, a third less CPU in a replay.
+  /// only a jump glides: the screen then redraws as the data comes (up to
+  /// 45 a second) instead of at its full rate, a third less CPU in a replay.
   final bool glideAll;
 
   @override
@@ -74,8 +74,8 @@ class _RingGaugeState extends State<RingGauge> {
     final glide = w.glideAll || DateTime.now().isBefore(_glideUntil);
     return TweenAnimationBuilder<_Vals>(
         tween: _ValsTween(end: _Vals(
-          (w.frontKw ?? 0).clamp(w.minKw, w.maxKw).toDouble(),
-          (w.rearKw ?? 0).clamp(w.minKw, w.maxKw).toDouble(),
+          w.frontKw ?? 0, // the figures tell the truth; only the arcs stop at the ends
+          w.rearKw ?? 0,
         )),
         duration: glide ? _glide : Duration.zero,
         curve: Curves.easeOut,
@@ -96,6 +96,13 @@ class _RingGaugeState extends State<RingGauge> {
 class _Vals {
   const _Vals(this.front, this.rear);
   final double front, rear;
+
+  // By value: unchanged power starts no animation and paints nothing.
+  @override
+  bool operator ==(Object o) => o is _Vals && o.front == front && o.rear == rear;
+  @override
+  int get hashCode => Object.hash(front, rear);
+
   _Vals lerp(_Vals o, double t) => _Vals(
         front + (o.front - front) * t,
         rear + (o.rear - rear) * t,
@@ -195,10 +202,10 @@ class _RingPainter extends CustomPainter {
   void _motor(void Function(double, double, Color) arc, double kw,
       {required double zero, required double posSpan, required double negSpan, required bool up}) {
     if (kw >= 0) {
-      final s = posSpan * kw / maxKw;
+      final s = posSpan * min(kw, maxKw) / maxKw;
       arc(up ? zero : zero - s, s, kAccent);
     } else {
-      final s = negSpan * kw / minKw;
+      final s = negSpan * max(kw, minKw) / minKw;
       arc(up ? zero - s : zero, s, kRegen);
     }
   }

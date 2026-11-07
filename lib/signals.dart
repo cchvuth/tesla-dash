@@ -56,11 +56,12 @@ const kSignals = <String, Sig>{
   // turning left), on the Commander's stream at 49 Hz; with the speed it
   // gives the sideways g, as its own g-sensor (0x111) never comes.
   'yaw': Sig(0x101, 0, 16, scale: 0.0001, signed: true, sna: 32768), // rad/s
-  // The brake pedal, 1 ON. DI_brakePedalState (19|2: 0 OFF, 1 ON, 2 INVALID)
-  // reads INVALID at all times since 2026.38. Bit 51 took over, found from
-  // the car's trace: set with the accelerator at 0 while stopping or held at
-  // a stop, clear while driving on it and coasting with regen, and clear in
-  // P with the foot off; bits 48-50 beside it stay 0.
+  // The brake lamp, 1 ON. DI_brakePedalState (19|2: 0 OFF, 1 ON, 2 INVALID)
+  // reads INVALID at all times since 2026.38. Bit 51 stands in: DI_regenLight
+  // in the DBC, the car's own regen-braking light. From the car's trace: set
+  // with the accelerator off while slowing or held at a stop, clear while
+  // driving on it and coasting, and clear in P; so it lights the dash's lamp
+  // as the car lights its own. Bits 48-50 beside it stay 0.
   'brake': Sig(0x118, 51, 1),
 
   // ID2E5 FrontInverterPower / ID266 RearInverterPower. Firmware 2026.38
@@ -80,7 +81,11 @@ const kSignals = <String, Sig>{
   // What else draws on the pack, beside the motors (see Panda.otherKw). On
   // the drive's trace compressor + 12 V made up the whole gap to within
   // ~0.2 kW, the heat pump doing the heating (cabin heater 0).
-  // ID2A7 CMPD_state: the heat pump compressor's HV input power.
+  // ID2A7 CMPD_state: the heat pump compressor's HV input power, voltage
+  // first (same frame, this order): the chassis bus reuses 0x2A7 for road
+  // curvature, and bus tags no longer tell them apart, so only a frame with
+  // the pack's voltage counts.
+  'compV': Sig(0x2A7, 41, 11, scale: 0.5),
   'compW': Sig(0x2A7, 21, 11, scale: 10), // W
   // ID2B4 PCS_dcdcRailStatus: the 12 V side, volts then amps (same frame,
   // this order): everything low-voltage, seat heaters and screens included.

@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io' show File, FileMode, FileSystemException;
+import 'dart:io' show File;
 import 'dart:math' show max, min, pi;
 
 import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform, listEquals;
@@ -81,7 +81,8 @@ class _DashPageState extends State<DashPage> {
   // Bluetooth is back (not with the switch on: it waits for the stream).
   int _settleMs = 1000, _buttonsMs = 0, _rejoinMs = 5000, _backMs = 15000;
   bool _wifiFirst = false; // Bluetooth waits for the WiFi stream, however long
-  bool _smooth = true; // the power ring and pedal line glide on every change
+  bool _smooth = false; // the power ring and pedal line glide on every change
+  bool _sparse = true; // slow ids polled rather than streamed (see Panda.sparse)
   int _lookMs = 3000; // the slider's look time; with the switch on the look has none
 
   /// What the look waits: the slider's time, or with the switch on, for the
@@ -118,6 +119,8 @@ class _DashPageState extends State<DashPage> {
     _backMs = prefs.getInt('btBackMs') ?? _backMs;
     _wifiFirst = prefs.getBool('btWifiFirst') ?? _wifiFirst;
     _smooth = prefs.getBool('smoothRing') ?? _smooth;
+    _sparse = prefs.getBool('sparsePolling') ?? _sparse;
+    _obd.sparse = _sparse;
     // Inside the slider's range, whatever was stored.
     _lookMs = (prefs.getInt('wifiLookMs') ?? _lookMs).clamp(1000, 10000).toInt();
     _applyLook();
@@ -167,40 +170,28 @@ class _DashPageState extends State<DashPage> {
   /// A line a second to trace.log in the app's external files folder, to read
   /// a drive afterwards over adb:
   /// adb pull /sdcard/Android/data/com.teslashdash.tesla_dash/files/trace.log
-  /// Rolls to trace.log.1 past 50 MB, so the two stay under 100 MB (about a
-  /// day of driving each).
+  /// Rolls to trace.log.1 past 50 MB, so the two stay under 100 MB (about 9
+  /// hours of driving each, at 5.4 MB an hour).
   File? _traceFile;
   Timer? _traceTimer;
 
   Future<void> _startTrace() async {
     // ponytail: Android only; iOS would need path_provider and a file-sharing key.
     if (defaultTargetPlatform != TargetPlatform.android) return;
-    try {
-      final dir = await const MethodChannel('tesla_dash/net').invokeMethod<String>('logDir');
-      if (dir == null || !mounted) return;
-      _traceFile = File('$dir/trace.log');
-    } on Exception {
-      return; // no folder (tests): no trace
-    }
+    final f = await traceLog();
+    if (f == null || !mounted) return; // no folder (tests): no trace
+    _traceFile = f;
     await loadBuild();
-    _trace('start: build=$diagBuild wifiFirst=$_wifiFirst look=${_lookMs}ms settle=${_settleMs}ms buttons=${_buttonsMs}ms '
+    _trace('start: build=$diagBuild sparse=$_sparse wifiFirst=$_wifiFirst look=${_lookMs}ms settle=${_settleMs}ms buttons=${_buttonsMs}ms '
         'data=${_rejoinMs}ms back=${_backMs}ms');
     _traceTimer = Timer.periodic(const Duration(seconds: 1), (t) {
       _trace('${_obd.traceLine()} | bt ${_bt.link.name} "${_bt.status}" wait=${_btWaitsFor()} push=${_bt.pushInfo}');
       // Twice a minute the whole Diagnostics report and every signal.
-      if (t.tick % 30 == 0 && _obd.frames.isNotEmpty) _trace('${_obd.traceDump()}\n${diagReport(_obd, _bt)}');
+      if (t.tick % 30 == 0 && (_obd.frames.isNotEmpty || _obd.viaBt)) _trace('${_obd.traceDump()}\n${diagReport(_obd, _bt)}');
     });
   }
 
-  void _trace(String line) {
-    final f = _traceFile!;
-    try {
-      if (f.existsSync() && f.lengthSync() > 50 << 20) f.renameSync('${f.path}.1');
-      f.writeAsStringSync('${DateTime.now().toIso8601String()} $line\n', mode: FileMode.append);
-    } on FileSystemException {
-      // a full or missing folder: skip the line
-    }
-  }
+  void _trace(String line) => traceWrite(_traceFile!, '${DateTime.now().toIso8601String()} $line\n');
   bool _streamSeen = true; // the last step-aside was followed by a stream
 
   /// Before a WiFi stream starts: Bluetooth off the Commander (see
@@ -353,6 +344,7 @@ class _DashPageState extends State<DashPage> {
     } else if (a == S3xyAction.mirrorTilt && const {'P', 'N', 'D'}.contains(_obd.gear)) {
       err = 'Mirror tilt acts in R only'; // S3XY: auto-tilt override, Reverse
     } else {
+      _obd.pressed();
       try {
         await _bt.tryAction(a);
       } catch (e) {
@@ -494,6 +486,19 @@ class _DashPageState extends State<DashPage> {
               },
             ),
           ]),
+          // Off, every id streams: doors and belts live, but more frames for
+          // the Commander to drop, speed's among them.
+          Row(children: [
+            const Expanded(child: Text('Sparse polling (steadier speed, slower doors and belts)')),
+            Switch(
+              value: _sparse,
+              onChanged: (v) async {
+                redraw(() => _sparse = v);
+                _obd.sparse = v;
+                (await SharedPreferences.getInstance()).setBool('sparsePolling', v);
+              },
+            ),
+          ]),
         ]),
         actions: [
           // Bluetooth sticks to the Commander it was approved on; this lets
@@ -562,11 +567,16 @@ class _DashPageState extends State<DashPage> {
             // Edge glows sit under the dash so they never cover the buttons:
             // indicators blink green in step with the car's flasher, blind
             // spot holds a steady red, brake red at the foot.
-            if (live && o.braking) const _Edge(side: _Side.bottom, color: Color(0xFFE23D3D)),
-            if (live && (o.blindL || (o.indL && o.blinkLit)))
-              _Edge(side: _Side.left, color: o.blindL ? const Color(0xFFE23D3D) : kRegen),
-            if (live && (o.blindR || (o.indR && o.blinkLit)))
-              _Edge(side: _Side.right, color: o.blindR ? const Color(0xFFE23D3D) : kRegen),
+            ListenableBuilder(
+              listenable: o.fast,
+              builder: (context, _) => Stack(fit: StackFit.expand, children: [
+                if (o.live && o.braking) const _Edge(side: _Side.bottom, color: Color(0xFFE23D3D)),
+                if (o.live && (o.blindL || (o.indL && o.blinkLit)))
+                  _Edge(side: _Side.left, color: o.blindL ? const Color(0xFFE23D3D) : kRegen),
+                if (o.live && (o.blindR || (o.indR && o.blinkLit)))
+                  _Edge(side: _Side.right, color: o.blindR ? const Color(0xFFE23D3D) : kRegen),
+              ]),
+            ),
             // Beside Google Maps, or in any split, the window is about half
             // as wide: the essentials only, laid out for it.
             if (MediaQuery.sizeOf(context).width < 700)
@@ -580,12 +590,15 @@ class _DashPageState extends State<DashPage> {
                 // widens one side and the screen's centre is not the ring's.
                 if (live)
                   IgnorePointer(
-                    child: Align(
-                      alignment: Alignment.topCenter,
-                      child: AnimatedFractionallySizedBox(
-                        duration: _smooth ? const Duration(milliseconds: 140) : Duration.zero,
-                        widthFactor: (o.pedalPct ?? 0).clamp(0, 100) / 100,
-                        child: Container(height: 4, color: kAccent),
+                    child: ListenableBuilder(
+                      listenable: o.fast,
+                      builder: (context, _) => Align(
+                        alignment: Alignment.topCenter,
+                        child: AnimatedFractionallySizedBox(
+                          duration: _smooth ? const Duration(milliseconds: 140) : Duration.zero,
+                          widthFactor: (o.pedalPct ?? 0).clamp(0, 100) / 100,
+                          child: Container(height: 4, color: kAccent),
+                        ),
                       ),
                     ),
                   ),
@@ -603,13 +616,16 @@ class _DashPageState extends State<DashPage> {
                         ])),
                         AspectRatio(
                           aspectRatio: 1,
-                          child: RingGauge(
-                            glideAll: _smooth,
-                            frontKw: live ? o.frontKw : null,
-                            rearKw: live ? o.rearKw : null,
-                            regenCapKw: live && o.gear != 'P' ? o.regenMaxKw : null, // no regen parked
-                            // Digital speed sits in the ring, the gear under it.
-                            child: _Centre(obd: o, gear: true),
+                          child: ListenableBuilder(
+                            listenable: o.fast,
+                            builder: (context, _) => RingGauge(
+                              glideAll: _smooth,
+                              frontKw: o.live ? o.frontKw : null,
+                              rearKw: o.live ? o.rearKw : null,
+                              regenCapKw: o.live && o.gear != 'P' ? o.regenMaxKw : null, // no regen parked
+                              // Digital speed sits in the ring, the gear under it.
+                              child: _Centre(obd: o, gear: true),
+                            ),
                           ),
                         ),
                         // The battery dial and the pack's figures pinned top and
@@ -624,7 +640,7 @@ class _DashPageState extends State<DashPage> {
                             // it only reads 0); charging, the charge card has
                             // its place.
                             if (o.wifiLive && !o.charging && o.gear != 'P' && (o.gLong != null || o.gLat != null))
-                              _GBall(obd: o),
+                              ListenableBuilder(listenable: o.fast, builder: (context, _) => _GBall(obd: o)),
                           ])),
                           Padding(padding: const EdgeInsets.only(bottom: 4), child: _Pack(obd: o)),
                         ])),
@@ -683,7 +699,7 @@ class _Compact extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final o = obd, live = o.live;
+    final o = obd;
     return Padding(
       padding: const EdgeInsets.fromLTRB(10, 6, 10, 8),
       child: Column(children: [
@@ -733,12 +749,15 @@ class _Compact extends StatelessWidget {
           child: Center(
             child: AspectRatio(
               aspectRatio: 1,
-              child: RingGauge(
-                glideAll: smooth,
-                frontKw: live ? o.frontKw : null,
-                rearKw: live ? o.rearKw : null,
-                regenCapKw: live && o.gear != 'P' ? o.regenMaxKw : null, // no regen parked
-                child: _Centre(obd: o),
+              child: ListenableBuilder(
+                listenable: o.fast,
+                builder: (context, _) => RingGauge(
+                  glideAll: smooth,
+                  frontKw: o.live ? o.frontKw : null,
+                  rearKw: o.live ? o.rearKw : null,
+                  regenCapKw: o.live && o.gear != 'P' ? o.regenMaxKw : null, // no regen parked
+                  child: _Centre(obd: o),
+                ),
               ),
             ),
           ),

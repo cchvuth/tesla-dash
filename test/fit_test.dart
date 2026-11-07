@@ -120,9 +120,13 @@ void main() {
     expect(find.text('READY'), findsNothing);
     const tip = 'WiFi: live, 0 speed frames/s (the car sends about 50), 0 frames/s in all';
     expect(t.getSize(find.byTooltip(tip)).width, 36);
-    // The speed frames a second under the icon, red at 0: the lag gauge.
-    final rate = t.widget<Text>(find.descendant(of: find.byTooltip(tip), matching: find.text('0')));
-    expect(rate.style!.color, kAlert);
+    // The speed frames a second under the icon: the lag gauge. None counted
+    // yet, as a stream starts, shows nothing rather than a false alarm.
+    expect(find.descendant(of: find.byTooltip(tip), matching: find.text('0')), findsNothing);
+    await t.pumpWidget(const SizedBox());
+    await t.pumpWidget(MaterialApp(theme: kTheme, home: DashPage(demo: Panda()..status = 'live'..speedHz = 12..speedKnown = true, bt: ready)));
+    await t.pump(const Duration(milliseconds: 300));
+    expect(t.widget<Text>(find.text('12')).style!.color, kAlert);
     await t.pumpWidget(const SizedBox());
   });
 
@@ -182,15 +186,24 @@ void main() {
     expect(wifi.lookMs, look); // what the Android look waits, at its next run
     await slide('Bluetooth buttons after WiFi is live', 400); // all the way up
     expect(find.text('Bluetooth buttons after WiFi is live: 10.0 s'), findsOneWidget);
-    // The power ring's glide: on unless switched off, and kept.
+    // The power ring's glide: off unless switched on, and kept.
     expect(find.text('Smooth power ring (more battery)'), findsOneWidget);
-    final smooth = find.byType(Switch).last;
-    expect(t.widget<Switch>(smooth).value, isTrue);
+    final smooth = find.byType(Switch).at(1);
+    expect(t.widget<Switch>(smooth).value, isFalse);
     await t.ensureVisible(smooth);
     await t.tap(smooth);
     await _frames(t);
-    expect(t.widget<Switch>(smooth).value, isFalse);
-    expect(prefs.getBool('smoothRing'), isFalse);
+    expect(t.widget<Switch>(smooth).value, isTrue);
+    expect(prefs.getBool('smoothRing'), isTrue);
+    // Sparse polling: on unless switched off, kept, and told to the link.
+    final sparse = find.byType(Switch).last;
+    expect(t.widget<Switch>(sparse).value, isTrue);
+    await t.ensureVisible(sparse);
+    await t.tap(sparse);
+    await _frames(t);
+    expect(t.widget<Switch>(sparse).value, isFalse);
+    expect(prefs.getBool('sparsePolling'), isFalse);
+    expect(wifi.sparse, isFalse);
     expect(prefs.getInt('btButtonsMs'), 10000);
     await slide('Bluetooth data after WiFi is live', -400); // all the way down
     expect(find.text('Bluetooth data after WiFi is live: 0.0 s'), findsOneWidget);
@@ -345,25 +358,24 @@ void main() {
     await t.pumpWidget(const SizedBox());
   });
 
-  testWidgets('Diagnostics and its dialogs', (t) async {
+  testWidgets('Diagnostics scrolls to every frame', (t) async {
     final o = Panda();
     for (var id = 0x100; id < 0x140; id++) {
       o.frames[id] = Frame(0);
     }
     await t.pumpWidget(MaterialApp(theme: kTheme, home: DiagPage(obd: o, bt: Commander())));
     await _frames(t);
-    // Every tool and every frame below them can be scrolled to.
     await t.scrollUntilVisible(find.text('0x13F'), 200);
-    for (final (tool, button) in [('Find tyre pressure', 'Search'), ('Find nav data', 'Start')]) {
-      await t.scrollUntilVisible(find.text(tool), -200);
-      await t.pump(); // lay out where it scrolled to before tapping
-      await t.tap(find.text(tool));
-      await _frames(t);
-      await _fits(t, button);
-      await t.tap(find.text('Cancel'));
-      await _frames(t);
-    }
     await t.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('the ring\'s figures pass where its arcs stop', (t) async {
+    await t.pumpWidget(const MaterialApp(
+        home: RingGauge(glideAll: false, frontKw: -92, rearKw: 300, child: SizedBox())));
+    await t.pumpAndSettle();
+    final p = t.widget<CustomPaint>(find.descendant(of: find.byType(RingGauge), matching: find.byType(CustomPaint)).first);
+    final dynamic v = (p.painter as dynamic).v;
+    expect((v.front, v.rear), (-92.0, 300.0));
   });
 
   testWidgets('glide off: small changes land at once, jumps still glide', (t) async {
@@ -379,5 +391,28 @@ void main() {
     await t.pumpWidget(MaterialApp(
         home: RingGauge(frontKw: 0, rearKw: 21, child: const SizedBox()))); // glide on: every change
     expect(t.hasRunningAnimations, isTrue);
+  });
+
+  testWidgets('what moves redraws on the fast tick, the rest with the page', (t) async {
+    final o = Panda()
+      ..status = 'live'
+      ..kph = true
+      ..gear = 'D'
+      ..speed = 50
+      ..outsideC = 4.5;
+    await t.pumpWidget(MaterialApp(theme: kTheme, home: DashPage(demo: o, bt: Commander())));
+    await _frames(t);
+    expect(find.text('50'), findsOneWidget);
+    o
+      ..speed = 61
+      ..outsideC = 7.5
+      ..fastTick();
+    await t.pump();
+    expect(find.text('61'), findsOneWidget); // the speed: at once
+    expect(find.textContaining('4.5'), findsOneWidget); // the card: not yet
+    o.notifyListeners();
+    await t.pump();
+    expect(find.textContaining('7.5'), findsOneWidget);
+    await t.pumpWidget(const SizedBox());
   });
 }
