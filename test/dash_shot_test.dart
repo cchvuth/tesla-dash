@@ -208,6 +208,12 @@ void main() {
       for (var i = 0; i < 20; i++) {
         await t.pump(const Duration(milliseconds: 16));
       }
+      // The car's pictures decode off the test's clock: wait for them, or a
+      // shot can miss them.
+      await t.runAsync(() => Future.wait([
+            for (final e in find.byType(Image).evaluate()) precacheImage((e.widget as Image).image, e),
+          ]));
+      await t.pump();
       final out = Platform.environment['DASH_SHOT'];
       if (out != null) {
         await t.runAsync(() async {
@@ -322,6 +328,8 @@ void main() {
       ..navRoute = true
       ..navMinutes = 8
       ..navEnergyKwh = 49.44
+      ..cabinC1 = 21
+      ..cabinC3 = 17
       ..buckled.add('D');
     o.frames[0x238] = Frame(0);
     o.frames[0x3A1] = Frame(0);
@@ -333,9 +341,20 @@ void main() {
     // 301 km at arrival, 8 less than the 309 now.
     expect(find.textContaining('301 km', findRichText: true), findsOneWidget);
     expect(find.textContaining('−8', findRichText: true), findsOneWidget);
-    final green = find.byWidgetPredicate((w) =>
-        w is Container && w.decoration is BoxDecoration && (w.decoration as BoxDecoration).color == kRegen);
-    expect(green, findsOneWidget);
+    // The image's driver seat tinted green; the rest grey, none red.
+    Finder seats(Color c) => find.byWidgetPredicate((w) => w is Image && w.color == c);
+    expect(seats(kRegen), findsOneWidget);
+    expect(t.widget<Image>(seats(kRegen)).image, const AssetImage('assets/car/seat_D.png'));
+    expect(seats(kAlert), findsNothing);
+    expect(find.text('17°'), findsOneWidget);
+    o
+      ..belt3R = true // someone sat in the back, unbuckled
+      ..notifyListeners();
+    await t.pump();
+    expect(t.widget<Image>(seats(kAlert)).image, const AssetImage('assets/car/seat_3R.png'));
+    // That row's figure steps off the red seat; the others stay.
+    expect(find.text('17°'), findsNothing);
+    expect(find.text('21°'), findsOneWidget);
     await t.pumpWidget(const SizedBox());
   });
 

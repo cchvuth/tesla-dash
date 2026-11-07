@@ -610,8 +610,6 @@ class _DashPageState extends State<DashPage> {
                         _Actions(obd: o, bt: _bt, onTap: _press),
                         Expanded(child: _SideColumn(children: [
                           _Lights(obd: o),
-                          // Only WiFi has the tyres; none over Bluetooth.
-                          if (!o.viaBt) _Tyres(obd: o),
                           _Cabin(obd: o),
                         ])),
                         AspectRatio(

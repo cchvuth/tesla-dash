@@ -333,7 +333,7 @@ void main() {
   }
 
   // ScanMyTesla off: the Commander's Bluetooth data alone, and what only
-  // WiFi has (the tyres) gone from the column.
+  // WiFi has (the car: tyres, seats, cabin) gone from the column.
   testWidgets('Dash on Bluetooth only', (t) async {
     t.view.physicalSize = const Size(823, 384);
     final o = Panda()
@@ -343,7 +343,7 @@ void main() {
     await _frames(t);
     expect(find.text('74'), findsOneWidget);
     expect(find.text('AUTOPILOT'), findsOneWidget);
-    expect(find.text('TYRES  psi'), findsNothing);
+    expect(find.image(const AssetImage('assets/car/car.png')), findsNothing);
     await t.pumpWidget(const SizedBox());
   });
 

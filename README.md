@@ -19,15 +19,16 @@ It shows:
 - the lights on (DRL, low, high) and grip, each only while on: the car's
   slippery-road verdict and traction or stability control stepping in
   (both while moving), Slip Start left on;
-- the outside temperature (ice blue near freezing), washer fluid low, tyre
-  pressures, the pack's coldest cells and whether it is heating, cell
-  imbalance and degradation;
+- the outside temperature (ice blue near freezing), washer fluid low, cell
+  imbalance and degradation; the pack's coldest cells and whether it is
+  heating over the battery %;
 - the route along the bottom: time to go and arrival time, the energy
   and range it uses, and battery and range at arrival (plus its length and
   the destination when the Commander has them);
-- the seven seats: each row's temperature, the front and second rows'
-  fans (Auto's level when on Auto), buckled belts in green and a
-  taken seat left unbuckled in red;
+- the car from above: tyre pressures on the wheels, and on the seven seats
+  each row's temperature, the front and second rows' fans (Auto's level
+  when on Auto), buckled belts in green and a taken seat left unbuckled in
+  red;
 - a g-meter like Track Mode's: a dot for the force felt (up braking, down
   speeding up, right in a left turn), the g now and this drive's peak
   (WiFi only; across is the yaw rate times the speed);
